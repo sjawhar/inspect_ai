@@ -80765,7 +80765,6 @@ Supported expressions:
     };
     const grid = "_grid_1oibv_1";
     const selected = "_selected_1oibv_13";
-    const sampleRowLink = "_sampleRowLink_1oibv_17";
     const disabled = "_disabled_1oibv_23";
     const cell = "_cell_1oibv_28";
     const wrapAnywhere = "_wrapAnywhere_1oibv_33";
@@ -80774,7 +80773,6 @@ Supported expressions:
     const styles$5 = {
       grid,
       selected,
-      sampleRowLink,
       disabled,
       cell,
       wrapAnywhere,
@@ -80789,8 +80787,7 @@ Supported expressions:
       completed,
       scoreRendered,
       gridColumnsTemplate,
-      height,
-      showSample
+      height
     }) => {
       const streamSampleData = useStore(
         (state) => state.capabilities.streamSampleData
@@ -80860,7 +80857,13 @@ Supported expressions:
           ]
         }
       );
-      return sampleUrl && isViewable ? /* @__PURE__ */ jsxRuntimeExports.jsx(Link, { to: sampleUrl, className: styles$5.sampleRowLink, children: rowContent }) : /* @__PURE__ */ jsxRuntimeExports.jsx("div", { onClick: isViewable ? () => showSample(index2) : void 0, children: rowContent });
+      return /* @__PURE__ */ jsxRuntimeExports.jsx(
+        "div",
+        {
+          onClick: isViewable ? () => sampleNavigation.showSample(index2) : void 0,
+          children: rowContent
+        }
+      );
     };
     const row = "_row_utdq5_1";
     const styles$4 = {
@@ -80952,20 +80955,12 @@ Supported expressions:
     const kSeparatorHeight = 24;
     const kSampleFollowProp = "sample-list";
     const SampleList = reactExports.memo((props) => {
-      const {
-        items,
-        totalItemCount,
-        running: running2,
-        nextSample,
-        prevSample,
-        showSample,
-        className: className2,
-        listHandle
-      } = props;
+      const { items, totalItemCount, running: running2, className: className2, listHandle } = props;
       const { getRestoreState, isScrolling } = useVirtuosoState(
         listHandle,
         "sample-list"
       );
+      const sampleNavigation = useSampleNavigation();
       const selectedSampleIndex = useStore(
         (state) => state.log.selectedSampleIndex
       );
@@ -81003,23 +80998,28 @@ Supported expressions:
         (e) => {
           switch (e.key) {
             case "ArrowUp":
-              prevSample();
+              sampleNavigation.previousSample();
               e.preventDefault();
               e.stopPropagation();
               break;
             case "ArrowDown":
-              nextSample();
+              sampleNavigation.nextSample();
               e.preventDefault();
               e.stopPropagation();
               break;
             case "Enter":
-              showSample(selectedSampleIndex);
+              sampleNavigation.showSample(selectedSampleIndex);
               e.preventDefault();
               e.stopPropagation();
               break;
           }
         },
-        [selectedSampleIndex, nextSample, prevSample, showSample]
+        [
+          selectedSampleIndex,
+          sampleNavigation.nextSample,
+          sampleNavigation.previousSample,
+          sampleNavigation.showSample
+        ]
       );
       const gridColumnsTemplate = reactExports.useMemo(() => {
         return gridColumnsValue(samplesDescriptor);
@@ -81037,8 +81037,7 @@ Supported expressions:
                 answer: item2.answer,
                 completed: item2.completed,
                 scoreRendered: item2.scoreRendered,
-                gridColumnsTemplate,
-                showSample
+                gridColumnsTemplate
               }
             );
           } else if (item2.type === "separator") {
@@ -81054,7 +81053,7 @@ Supported expressions:
             return null;
           }
         },
-        [showSample, gridColumnsTemplate]
+        [gridColumnsTemplate]
       );
       const { input: input2, limit, answer: answer2, target: target2 } = gridColumns(samplesDescriptor);
       const sampleCount = items == null ? void 0 : items.reduce((prev, current2) => {
@@ -81377,7 +81376,6 @@ Supported expressions:
       );
       const sampleSummaries = useFilteredSamples();
       const selectedLogSummary = useStore((state) => state.log.selectedLogSummary);
-      const sampleNavigation = useSampleNavigation();
       const evalSampleCount = reactExports.useMemo(() => {
         const limit = selectedLogSummary == null ? void 0 : selectedLogSummary.eval.config.limit;
         const limitCount = limit === null || limit === void 0 ? void 0 : typeof limit === "number" ? limit : limit[1] - limit[0];
@@ -81462,10 +81460,7 @@ Supported expressions:
               listHandle: sampleListHandle,
               items,
               totalItemCount: evalSampleCount,
-              running: running2,
-              nextSample: sampleNavigation.nextSample,
-              prevSample: sampleNavigation.previousSample,
-              showSample: sampleNavigation.showSample
+              running: running2
             }
           ) : void 0,
           showingSampleDialog && /* @__PURE__ */ jsxRuntimeExports.jsx(
