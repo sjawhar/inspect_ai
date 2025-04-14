@@ -27,13 +27,20 @@ from inspect_ai.model._chat_message import (
     ChatMessageAssistant,
 )
 from inspect_ai.model._model_output import ChatCompletionChoice, ModelOutput
+from inspect_ai.util._limit import message_limit as create_message_limit
+from inspect_ai.util._limited_conversation import ChatMessageList
 
 
 class AgentState:
     """Agent state."""
 
-    def __init__(self, *, messages: list[ChatMessage]) -> None:
-        self._messages = messages
+    def __init__(
+        self, *, messages: list[ChatMessage], message_limit: int | None
+    ) -> None:
+        self._message_limit = create_message_limit(message_limit)
+        self._messages: list[ChatMessage] = ChatMessageList(
+            messages, self._message_limit
+        )
         self._output: ModelOutput | None = None
 
     @property
@@ -43,8 +50,15 @@ class AgentState:
 
     @messages.setter
     def messages(self, messages: list[ChatMessage]) -> None:
-        """Set the conversation history."""
-        self._messages = messages
+        self._messages = ChatMessageList(messages, self._message_limit)
+
+    @property
+    def message_limit(self) -> int | None:
+        return self._message_limit.limit
+
+    @message_limit.setter
+    def message_limit(self, limit: int | None) -> None:
+        self._message_limit.limit = limit
 
     @property
     def output(self) -> ModelOutput:
@@ -76,12 +90,17 @@ class AgentState:
         self._output = output
 
     def __copy__(self) -> "AgentState":
-        state = AgentState(messages=copy(self.messages))
+        state = AgentState(
+            messages=copy(self.messages), message_limit=self._message_limit._limit
+        )
         state.output = self.output.model_copy()
         return state
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "AgentState":
-        state = AgentState(messages=deepcopy(self.messages, memo))
+        state = AgentState(
+            messages=deepcopy(self.messages, memo),
+            message_limit=self._message_limit._limit,
+        )
         state.output = self.output.model_copy(deep=True)
         return state
 

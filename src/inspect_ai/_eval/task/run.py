@@ -731,9 +731,10 @@ async def task_run_sample(
                 if time_limit is not None:
                     timeout_cm = anyio.fail_after(time_limit / 2)
 
-                # turn off message limits. no need to turn off token limits as the ctx
-                # manager is closed.
-                state.message_limit = None
+                # TODO: Do we need to "turn off" message limit?
+                # Given we're not checking on generate(), a scorer would only end up
+                # hitting a LimitExceededError if it adds to the
+                # `ModelConversation`/`TaskState.messages`.
                 set_sample_state(state)
 
                 # scoring

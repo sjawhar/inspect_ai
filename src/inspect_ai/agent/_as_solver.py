@@ -23,6 +23,7 @@ def as_solver(agent: Agent, **agent_kwargs: Any) -> Solver:
 
     Args:
        agent: Agent to convert.
+       message_limit: ...
        **agent_kwargs: Arguments to curry to Agent function (required
           if the agent has parameters without default values).
 
@@ -54,7 +55,8 @@ def as_solver(agent: Agent, **agent_kwargs: Any) -> Solver:
         async def solve(state: TaskState, generate: Generate) -> TaskState:
             # run agent
             agent_state = await agent(
-                AgentState(messages=state.messages), **agent_kwargs
+                AgentState(messages=state.messages, message_limit=state.message_limit),
+                **agent_kwargs,
             )
 
             # update messages

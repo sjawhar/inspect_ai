@@ -14,6 +14,7 @@ def agent_loop(message_limit: int = 50):
     async def solve(state: TaskState, generate: Generate):
 
         # establish messages limit so we have a termination condition
+        # TODO: Update example to follow new way of setting message limits.
         state.message_limit = message_limit
 
         try:

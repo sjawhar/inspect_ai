@@ -322,6 +322,38 @@ def test_react_agent_concatenates():
     assert log.results.scores[0].metrics["accuracy"].value == 1.0
 
 
+def test_react_agent_respects_message_limit() -> None:
+    addition_task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target=["2", "2.0", "Two"])],
+        solver=react(tools=[addition()], attempts=20, message_limit=10),
+        scorer=includes(),
+    )
+    model = get_model("mockllm/model")
+
+    log = eval(addition_task, model)[0]
+
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 0.0
+    assert log.samples
+    assert len(log.samples[0].messages) == 10
+
+
+def test_react_agent_uses_task_message_limit():
+    # TODO: Is this behaviour that we want?
+    addition_task = Task(
+        dataset=[Sample(input="What is 1 + 1?", target=["2", "2.0", "Two"])],
+        solver=react(tools=[addition()], attempts=20),
+        scorer=includes(),
+        message_limit=3,
+    )
+    model = get_model("mockllm/model")
+
+    log = eval(addition_task, model)[0]
+
+    assert log.status == "success"
+    assert len(log.samples[0].messages) == 3
+
+
 @scorer(metrics=[accuracy()])
 def compare_quantities():
     async def score(state: TaskState, target: Target) -> Score:

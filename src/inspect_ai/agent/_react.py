@@ -39,6 +39,9 @@ def react(
     attempts: int | AgentAttempts = 1,
     submit: AgentSubmit = AgentSubmit(),
     on_continue: str | AgentContinue | None = None,
+    # TODO: Do we accept an int, a MessageLimit or a list of Limit?
+    # Message limit is special as we need to explicitly call check() on it with a count.
+    message_limit: int | None = None,
 ) -> Agent:
     """Extensible ReAct agent based on the paper [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629).
 
@@ -76,6 +79,7 @@ def react(
           is called on _every_ iteration of the loop so if you only want to send
           a message back when the model fails to call tools you need to code
           that behavior explicitly.
+        message_limit: ...
 
     Returns:
         ReAct agent.
@@ -144,6 +148,11 @@ def react(
         if system_message:
             state.messages.insert(0, system_message)
 
+        # TODO: copied from basic_agent. Do we want the same behaviour?
+        # TODO: Should the AgentState be responsible for checking/enforcing limit, or
+        # the agent implementation (i.e. here)?
+        state.message_limit = message_limit or state.message_limit or 50
+
         # track attempts
         attempt_count = 0
 
@@ -151,6 +160,11 @@ def react(
             # main loop = will terminate after submit (subject to max_attempts)
             # or if a message or token limit is hit
             while True:
+                # don't generate if we're already at the message limit
+                # TODO: Does every agent need to check this, or should we somehow
+                # move this check back to generate()?
+                state._message_limit.check(len(state.messages), raise_for_equal=True)
+
                 # generate output and append assistant message
                 state = await _agent_generate(model, state, tools)
 

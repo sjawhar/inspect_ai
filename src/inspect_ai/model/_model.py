@@ -49,7 +49,6 @@ from inspect_ai.tool._tool_call import ToolCallModelInputHints
 from inspect_ai.tool._tool_def import ToolDef, tool_defs
 from inspect_ai.util import concurrency
 from inspect_ai.util._limit import (
-    LimitExceededError,
     check_token_limit,
     record_model_usage,
 )
@@ -352,11 +351,12 @@ class Model:
         Returns:
            ModelOutput
         """
-        # if we are the default model then enforce message limit if it
-        # exists (raise an exception if it is exceeded)
+        # TODO: Check we haven't broken any usages of generate() by removing message
+        # limit check.
+        # if we are the default model then update the displayed message count
         is_active_model = self == active_model()
         if is_active_model:
-            handle_sample_message_limit(input)
+            set_total_messages(input)
 
         # base config for this model
         base_config = self.config
@@ -1408,22 +1408,13 @@ _model_roles: ContextVar[dict[str, Model]] = ContextVar("model_roles", default={
 
 
 # shared contexts for asyncio tasks
-def handle_sample_message_limit(input: str | list[ChatMessage]) -> None:
-    from inspect_ai.log._samples import (
-        active_sample_message_limit,
-        set_active_sample_total_messages,
-    )
+def set_total_messages(input: str | list[ChatMessage]) -> None:
+    from inspect_ai.log._samples import set_active_sample_total_messages
 
-    total_messages = 1 if isinstance(input, str) else len(input)
-    message_limit = active_sample_message_limit()
-    if message_limit is not None:
-        if total_messages >= message_limit:
-            raise LimitExceededError(
-                "message", value=total_messages, limit=message_limit
-            )
+    existing_message_count = 1 if isinstance(input, str) else len(input)
 
     # set total messages
-    set_active_sample_total_messages(total_messages)
+    set_active_sample_total_messages(existing_message_count)
 
 
 def init_model_usage() -> None:
