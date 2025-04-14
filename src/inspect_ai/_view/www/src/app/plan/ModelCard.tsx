@@ -1,11 +1,11 @@
 import { FC } from "react";
 
 import clsx from "clsx";
-import styles from "./ModelCard.module.css";
-import { Card, CardHeader, CardBody } from "../../components/Card";
-import { EvalSpec, EvalModelConfig } from "../../@types/log";
+import { EvalModelConfig, EvalSpec } from "../../@types/log";
+import { Card, CardBody, CardHeader } from "../../components/Card";
 import { ApplicationIcons } from "../appearance/icons";
 import { MetaDataGrid } from "../content/MetaDataGrid";
+import styles from "./ModelCard.module.css";
 
 interface ModelCardProps {
   evalSpec?: EvalSpec;
@@ -62,7 +62,8 @@ export const ModelCard: FC<ModelCardProps> = ({ evalSpec }) => {
                 </div>
                 <div className={clsx("text-style-label")}>Configuration</div>
                 <div className="text-size-small">
-                  {Object.keys(modelInfo.config).length > 0 ? (
+                  {modelInfo.config &&
+                  Object.keys(modelInfo.config).length > 0 ? (
                     <MetaDataGrid
                       entries={
                         modelInfo.config as any as Record<string, unknown>
