@@ -30201,12 +30201,12 @@ Please change the parent <Route path="${parentPath}"> to <Route path="${parentPa
     const kLogViewSamplesTabId = "samples";
     const kLogViewJsonTabId = "json";
     const kLogViewInfoTabId = "info";
-    const kSampleMessagesTabId = `sample-display-messages`;
-    const kSampleTranscriptTabId = `sample-display-transcript`;
-    const kSampleScoringTabId = `sample-display-scoring`;
-    const kSampleMetdataTabId = `sample-display-metadata`;
-    const kSampleErrorTabId = `sample-display-error`;
-    const kSampleJsonTabId = `sample-display-json`;
+    const kSampleMessagesTabId = `messages`;
+    const kSampleTranscriptTabId = `transcript`;
+    const kSampleScoringTabId = `scoring`;
+    const kSampleMetdataTabId = `metadata`;
+    const kSampleErrorTabId = `error`;
+    const kSampleJsonTabId = `sample-json`;
     const kScoreTypePassFail = "passfail";
     const kScoreTypeCategorical = "categorical";
     const kScoreTypeNumeric = "numeric";
@@ -53859,7 +53859,7 @@ categories: ${categories.join(" ")}`;
     const useSampleNavigation = () => {
       const navigate = useNavigate();
       const logDirectory = useStore((state) => state.logs.logs.log_dir);
-      const { logPath, tabId } = useParams();
+      const { logPath, tabId, sampleTabId } = useParams();
       const getSelectedLogFile = useStore(
         (state) => state.logsActions.getSelectedLogFile
       );
@@ -53882,15 +53882,16 @@ categories: ${categories.join(" ")}`;
         (state) => state.appActions.setShowingSampleDialog
       );
       const showSample = reactExports.useCallback(
-        (index) => {
+        (index, specifiedSampleTabId) => {
           if (sampleSummaries && index >= 0 && index < sampleSummaries.length) {
             const sample2 = sampleSummaries[index];
             const resolvedPath = resolveLogPath();
             if (resolvedPath) {
               selectSample(index);
               setShowingSampleDialog(true);
+              const currentSampleTabId = specifiedSampleTabId || sampleTabId;
               navigate(
-                `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sample2.id}/${sample2.epoch}`
+                currentSampleTabId ? `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sample2.id}/${sample2.epoch}/${currentSampleTabId}` : `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sample2.id}/${sample2.epoch}`
               );
             }
           }
@@ -53901,31 +53902,33 @@ categories: ${categories.join(" ")}`;
           selectSample,
           setShowingSampleDialog,
           navigate,
-          tabId
+          tabId,
+          sampleTabId
         ]
       );
       const nextSample = reactExports.useCallback(() => {
         const itemsCount = sampleSummaries.length;
         const next = Math.min(selectedSampleIndex + 1, itemsCount - 1);
         if (next > -1) {
-          selectSample(next);
+          showSample(next, sampleTabId);
         }
-      }, [selectedSampleIndex, showSample]);
+      }, [selectedSampleIndex, showSample, sampleTabId]);
       const previousSample = reactExports.useCallback(() => {
         const prev = selectedSampleIndex - 1;
         if (prev > -1) {
-          selectSample(prev);
+          showSample(prev, sampleTabId);
         }
-      }, [selectedSampleIndex, showSample]);
+      }, [selectedSampleIndex, showSample, sampleTabId]);
       const getSampleUrl = reactExports.useCallback(
-        (sampleId, epoch) => {
+        (sampleId, epoch, specificSampleTabId) => {
           const resolvedPath = resolveLogPath();
           if (resolvedPath) {
-            return `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sampleId}/${epoch}`;
+            const currentSampleTabId = specificSampleTabId || sampleTabId;
+            return currentSampleTabId ? `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sampleId}/${epoch}/${currentSampleTabId}` : `/logs/${resolvedPath}/${tabId || "samples"}/sample/${sampleId}/${epoch}`;
           }
           return void 0;
         },
-        [resolveLogPath, tabId]
+        [resolveLogPath, tabId, sampleTabId]
       );
       const clearSampleUrl = reactExports.useCallback(() => {
         const resolvedPath = resolveLogPath();
@@ -71543,6 +71546,9 @@ ${events}
       const runningSampleData = sampleData.running;
       const selectedTab = useStore((state) => state.app.tabs.sample);
       const setSelectedTab = useStore((state) => state.appActions.setSampleTab);
+      const { sampleTabId } = useParams();
+      const effectiveSelectedTab = sampleTabId || selectedTab;
+      const navigate = useNavigate();
       const sampleSummary = sampleSummaries[selectedSampleIndex];
       const sampleEvents = (sample2 == null ? void 0 : sample2.events) || runningSampleData;
       const sampleMessages = reactExports.useMemo(() => {
@@ -71554,12 +71560,38 @@ ${events}
           return [];
         }
       }, [sample2 == null ? void 0 : sample2.messages, runningSampleData]);
-      const onSelectedTab = (e) => {
-        const el = e.currentTarget;
-        const id2 = el.id;
-        setSelectedTab(id2);
-        return false;
-      };
+      const {
+        logPath: urlLogPath,
+        tabId: urlTabId,
+        sampleId: urlSampleId,
+        epoch: urlEpoch
+      } = useParams();
+      const onSelectedTab = reactExports.useCallback(
+        (e) => {
+          const el = e.currentTarget;
+          const id2 = el.id;
+          setSelectedTab(id2);
+          if (id2 !== sampleTabId) {
+            if (urlLogPath && urlSampleId && urlEpoch) {
+              navigate(
+                `/logs/${urlLogPath}/${urlTabId || "samples"}/sample/${urlSampleId}/${urlEpoch}/${id2}`
+              );
+            } else {
+              navigate(`/logs/${urlLogPath}/${urlTabId || "samples"}/${id2}`);
+            }
+          }
+          return false;
+        },
+        [
+          sampleTabId,
+          urlLogPath,
+          urlTabId,
+          urlSampleId,
+          urlEpoch,
+          navigate,
+          setSelectedTab
+        ]
+      );
       const sampleMetadatas = metadataViewsForSample(`${baseId}-${id}`, sample2);
       const tabsetId = `task-sample-details-tab-${id}`;
       const targetId = `${tabsetId}-content`;
@@ -71580,7 +71612,7 @@ ${events}
             false,
             {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 104,
+              lineNumber: 151,
               columnNumber: 7
             },
             void 0
@@ -71591,7 +71623,7 @@ ${events}
       return /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(reactExports.Fragment, { children: [
         sample2 || sampleSummary ? /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(SampleSummaryView, { parent_id: id, sample: sample2 || sampleSummary }, void 0, false, {
           fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-          lineNumber: 119,
+          lineNumber: 166,
           columnNumber: 9
         }, void 0) : void 0,
         /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
@@ -71609,7 +71641,7 @@ ${events}
                   className: "sample-tab",
                   title: "Transcript",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleTranscriptTabId || selectedTab === void 0,
+                  selected: effectiveSelectedTab === kSampleTranscriptTabId || effectiveSelectedTab === void 0,
                   scrollable: false,
                   children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
                     TranscriptVirtualList,
@@ -71623,7 +71655,7 @@ ${events}
                     false,
                     {
                       fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                      lineNumber: 138,
+                      lineNumber: 186,
                       columnNumber: 11
                     },
                     void 0
@@ -71633,7 +71665,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 127,
+                  lineNumber: 174,
                   columnNumber: 9
                 },
                 void 0
@@ -71645,7 +71677,7 @@ ${events}
                   className: clsx("sample-tab", styles$z.fullWidth, styles$z.chat),
                   title: "Messages",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleMessagesTabId,
+                  selected: effectiveSelectedTab === kSampleMessagesTabId,
                   scrollable: false,
                   children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
                     ChatViewVirtualList,
@@ -71661,7 +71693,7 @@ ${events}
                     false,
                     {
                       fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                      lineNumber: 155,
+                      lineNumber: 203,
                       columnNumber: 11
                     },
                     void 0
@@ -71671,7 +71703,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 146,
+                  lineNumber: 194,
                   columnNumber: 9
                 },
                 void 0
@@ -71683,10 +71715,10 @@ ${events}
                   className: "sample-tab",
                   title: "Scoring",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleScoringTabId,
+                  selected: effectiveSelectedTab === kSampleScoringTabId,
                   children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(SampleScoresView, { sample: sample2 }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 173,
+                    lineNumber: 221,
                     columnNumber: 11
                   }, void 0)
                 },
@@ -71694,7 +71726,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 165,
+                  lineNumber: 213,
                   columnNumber: 9
                 },
                 void 0
@@ -71706,14 +71738,14 @@ ${events}
                   className: clsx("sample-tab"),
                   title: "Metadata",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleMetdataTabId,
+                  selected: effectiveSelectedTab === kSampleMetdataTabId,
                   children: sampleMetadatas.length > 0 ? /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx(styles$z.metadataPanel), children: sampleMetadatas }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 183,
+                    lineNumber: 231,
                     columnNumber: 13
                   }, void 0) : /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(NoContentsPanel, { text: "No metadata" }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 185,
+                    lineNumber: 233,
                     columnNumber: 13
                   }, void 0)
                 },
@@ -71721,7 +71753,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 175,
+                  lineNumber: 223,
                   columnNumber: 9
                 },
                 void 0
@@ -71733,7 +71765,7 @@ ${events}
                   className: "sample-tab",
                   title: "Error",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleErrorTabId,
+                  selected: effectiveSelectedTab === kSampleErrorTabId,
                   children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx(styles$z.padded), children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
                     ANSIDisplay,
                     {
@@ -71744,13 +71776,13 @@ ${events}
                     false,
                     {
                       fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                      lineNumber: 197,
+                      lineNumber: 245,
                       columnNumber: 15
                     },
                     void 0
                   ) }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 196,
+                    lineNumber: 244,
                     columnNumber: 13
                   }, void 0)
                 },
@@ -71758,7 +71790,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 189,
+                  lineNumber: 237,
                   columnNumber: 11
                 },
                 void 0
@@ -71770,14 +71802,14 @@ ${events}
                   className: "sample-tab",
                   title: "JSON",
                   onSelected: onSelectedTab,
-                  selected: selectedTab === kSampleJsonTabId,
+                  selected: effectiveSelectedTab === kSampleJsonTabId,
                   children: !sample2 ? /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(NoContentsPanel, { text: "JSON not available" }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 212,
+                    lineNumber: 260,
                     columnNumber: 13
                   }, void 0) : sample2.messages.length > 100 ? /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(NoContentsPanel, { text: "JSON too large too display" }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 214,
+                    lineNumber: 262,
                     columnNumber: 13
                   }, void 0) : /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx(styles$z.padded, styles$z.fullWidth), children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
                     JSONPanel,
@@ -71790,13 +71822,13 @@ ${events}
                     false,
                     {
                       fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                      lineNumber: 217,
+                      lineNumber: 265,
                       columnNumber: 15
                     },
                     void 0
                   ) }, void 0, false, {
                     fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                    lineNumber: 216,
+                    lineNumber: 264,
                     columnNumber: 13
                   }, void 0)
                 },
@@ -71804,7 +71836,7 @@ ${events}
                 false,
                 {
                   fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                  lineNumber: 204,
+                  lineNumber: 252,
                   columnNumber: 9
                 },
                 void 0
@@ -71815,14 +71847,14 @@ ${events}
           true,
           {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-            lineNumber: 121,
+            lineNumber: 168,
             columnNumber: 7
           },
           void 0
         )
       ] }, void 0, true, {
         fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-        lineNumber: 117,
+        lineNumber: 164,
         columnNumber: 5
       }, void 0);
     };
@@ -71836,7 +71868,7 @@ ${events}
           /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(Card, { children: [
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardHeader, { label: "Usage" }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 239,
+              lineNumber: 287,
               columnNumber: 9
             }, void 0),
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardBody, { children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
@@ -71849,18 +71881,18 @@ ${events}
               false,
               {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 241,
+                lineNumber: 289,
                 columnNumber: 11
               },
               void 0
             ) }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 240,
+              lineNumber: 288,
               columnNumber: 9
             }, void 0)
           ] }, `sample-usage-${id}`, true, {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-            lineNumber: 238,
+            lineNumber: 286,
             columnNumber: 7
           }, void 0)
         );
@@ -71870,42 +71902,42 @@ ${events}
           /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(Card, { children: [
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardHeader, { label: "Time" }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 258,
+              lineNumber: 306,
               columnNumber: 9
             }, void 0),
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardBody, { children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx(styles$z.timePanel, "text-size-smaller"), children: [
               /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx("text-style-label", "text-style-secondary"), children: "Working" }, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 261,
+                lineNumber: 309,
                 columnNumber: 13
               }, void 0),
               /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { children: formatTime$1(sample2.working_time) }, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 264,
+                lineNumber: 312,
                 columnNumber: 13
               }, void 0),
               /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { className: clsx("text-style-label", "text-style-secondary"), children: "Total" }, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 265,
+                lineNumber: 313,
                 columnNumber: 13
               }, void 0),
               /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV("div", { children: formatTime$1(sample2.total_time) }, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 268,
+                lineNumber: 316,
                 columnNumber: 13
               }, void 0)
             ] }, void 0, true, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 260,
+              lineNumber: 308,
               columnNumber: 11
             }, void 0) }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 259,
+              lineNumber: 307,
               columnNumber: 9
             }, void 0)
           ] }, `sample-time-${id}`, true, {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-            lineNumber: 257,
+            lineNumber: 305,
             columnNumber: 7
           }, void 0)
         );
@@ -71915,7 +71947,7 @@ ${events}
           /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(Card, { children: [
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardHeader, { label: "Metadata" }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 278,
+              lineNumber: 326,
               columnNumber: 9
             }, void 0),
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardBody, { children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
@@ -71929,18 +71961,18 @@ ${events}
               false,
               {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 280,
+                lineNumber: 328,
                 columnNumber: 11
               },
               void 0
             ) }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 279,
+              lineNumber: 327,
               columnNumber: 9
             }, void 0)
           ] }, `sample-metadata-${id}`, true, {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-            lineNumber: 277,
+            lineNumber: 325,
             columnNumber: 7
           }, void 0)
         );
@@ -71950,7 +71982,7 @@ ${events}
           /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(Card, { children: [
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardHeader, { label: "Store" }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 293,
+              lineNumber: 341,
               columnNumber: 9
             }, void 0),
             /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(CardBody, { children: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(
@@ -71964,18 +71996,18 @@ ${events}
               false,
               {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-                lineNumber: 295,
+                lineNumber: 343,
                 columnNumber: 11
               },
               void 0
             ) }, void 0, false, {
               fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-              lineNumber: 294,
+              lineNumber: 342,
               columnNumber: 9
             }, void 0)
           ] }, `sample-store-${id}`, true, {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/samples/SampleDisplay.tsx",
-            lineNumber: 292,
+            lineNumber: 340,
             columnNumber: 7
           }, void 0)
         );
@@ -94602,7 +94634,7 @@ Supported expressions:
       }, void 0);
     };
     const LogViewContainer = () => {
-      const { logPath, tabId, sampleId, epoch } = useParams();
+      const { logPath, tabId, sampleId, epoch, sampleTabId } = useParams();
       const selectLogFile = useStore((state) => state.logsActions.selectLogFile);
       const refreshLogs = useStore((state) => state.logsActions.refreshLogs);
       const setWorkspaceTab = useStore((state) => state.appActions.setWorkspaceTab);
@@ -94610,6 +94642,7 @@ Supported expressions:
         (state) => state.appActions.setShowingSampleDialog
       );
       const selectSample = useStore((state) => state.logActions.selectSample);
+      const setSampleTab = useStore((state) => state.appActions.setSampleTab);
       const filteredSamples = useFilteredSamples();
       const setStatus = useStore((state) => state.appActions.setStatus);
       const setSelectedLogIndex = useStore(
@@ -94662,6 +94695,9 @@ Supported expressions:
           if (sampleIndex >= 0) {
             selectSample(sampleIndex);
             setShowingSampleDialog(true);
+            if (sampleTabId) {
+              setSampleTab(sampleTabId);
+            }
           }
         } else {
           clearSample();
@@ -94670,14 +94706,16 @@ Supported expressions:
       }, [
         sampleId,
         epoch,
+        sampleTabId,
         filteredSamples,
         selectSample,
+        setSampleTab,
         setShowingSampleDialog,
         clearSample
       ]);
       return /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(LogViewLayout, {}, void 0, false, {
         fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/log-view/LogViewContainer.tsx",
-        lineNumber: 112,
+        lineNumber: 121,
         columnNumber: 10
       }, void 0);
     };
@@ -94707,37 +94745,29 @@ Supported expressions:
             lineNumber: 30,
             columnNumber: 16
           }, void 0),
-          // Use the layout component
-          loader: () => {
-            if (!storeImplementation) {
-              return { initialRoute: null };
-            }
-            const storedHash = storeImplementation.getState().app.urlHash;
-            return { initialRoute: storedHash };
-          },
           children: [
             {
               index: true,
               // This will match exactly the "/" path
               element: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(LogViewContainer, {}, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/AppRouter.tsx",
-                lineNumber: 46,
+                lineNumber: 34,
                 columnNumber: 20
               }, void 0)
             },
             {
-              path: "logs/:logPath/:tabId?",
+              path: "/logs/:logPath/:tabId?/:sampleTabId?",
               element: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(LogViewContainer, {}, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/AppRouter.tsx",
-                lineNumber: 50,
+                lineNumber: 38,
                 columnNumber: 20
               }, void 0)
             },
             {
-              path: "logs/:logPath/:tabId?/sample/:sampleId/:epoch?",
+              path: "/logs/:logPath/:tabId?/sample/:sampleId/:epoch?/:sampleTabId?",
               element: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(LogViewContainer, {}, void 0, false, {
                 fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/AppRouter.tsx",
-                lineNumber: 54,
+                lineNumber: 42,
                 columnNumber: 20
               }, void 0)
             }
@@ -94747,7 +94777,7 @@ Supported expressions:
           path: "*",
           element: /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(Navigate, { to: "/", replace: true }, void 0, false, {
             fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/AppRouter.tsx",
-            lineNumber: 60,
+            lineNumber: 48,
             columnNumber: 16
           }, void 0)
         }
