@@ -94635,9 +94635,10 @@ Supported expressions:
               loading: true,
               error: void 0
             });
+            setSelectedLogIndex(-1);
+            setWorkspaceTab(kLogViewSamplesTabId);
             await refreshLogs();
             setSelectedLogIndex(0);
-            setWorkspaceTab(kLogViewSamplesTabId);
             setStatus({
               loading: false,
               error: void 0
@@ -94682,7 +94683,7 @@ Supported expressions:
       ]);
       return /* @__PURE__ */ jsxDevRuntimeExports.jsxDEV(LogViewLayout, {}, void 0, false, {
         fileName: "/Users/charlesteague/Development/inspect_ai/src/inspect_ai/_view/www/src/app/log-view/LogViewContainer.tsx",
-        lineNumber: 110,
+        lineNumber: 112,
         columnNumber: 10
       }, void 0);
     };
