@@ -1,8 +1,6 @@
 from logging import getLogger
 from typing import Any, Literal, get_args
 
-import ijson  # type: ignore
-from ijson import IncompleteJSONError
 from pydantic import BaseModel
 from pydantic_core import from_json
 from typing_extensions import override
@@ -188,6 +186,10 @@ def _validate_version(ver: int) -> None:
 
 
 def _read_header_streaming(log_file: str) -> EvalLog:
+    import ijson  # type: ignore
+    from ijson import IncompleteJSONError
+    # lazy-loading ijson because it has side-effects at import time
+
     with file(log_file, "rb") as f:
         # Do low-level parsing to get the version number and also
         # detect the presence of results or error sections
