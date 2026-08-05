@@ -36,6 +36,14 @@ class RootProbeRaisesSandbox(SandboxEnvironment):
         self.exec_calls.append((cmd, user))
         if cmd == ["mkdir", "-p", SANDBOX_TOOLS_DIR] and user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
+        if input is not None and "version" in input:
+            fork_rev = sandbox_tools._get_sandbox_tools_fork_revision()
+            return ExecResult(
+                success=True,
+                returncode=0,
+                stdout=f'{{"jsonrpc":"2.0","result":"1.2.1+tl.{fork_rev}","id":1}}',
+                stderr="",
+            )
         return ExecResult(success=True, returncode=0, stdout="", stderr="")
 
     async def write_file(self, file: str, contents: str | bytes) -> None:

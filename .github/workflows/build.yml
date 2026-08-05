@@ -387,10 +387,6 @@ jobs:
               - "src/inspect_ai/util/_checkpoint/**"
               - "tests/checkpoint/**"
 
-  # Fast gate: confirm sandbox_tools_version.txt is bumped to exactly N+1
-  # when the injectable source changed. Blocks downstream slow jobs on
-  # failure so PR contributors don't wait on a Docker build to learn they
-  # forgot the bump.
   check-version-bump:
     needs: detect-slow
     if: needs.detect-slow.outputs.tools_changed == 'true'
@@ -404,44 +400,44 @@ jobs:
           fetch-tags: true
           filter: "blob:none"
 
-      - name: Check version bump
+      - name: Check fork revision bump
         id: bump
         env:
           INJECTABLE_SRC_CHANGED: ${{ needs.detect-slow.outputs.injectable_src_changed }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          VERSION_PATH="src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt"
-          BASE_VERSION=$(git show "origin/${BASE_REF}:${VERSION_PATH}" | tr -d '[:space:]')
-          PR_VERSION=$(tr -d '[:space:]' < "${VERSION_PATH}")
-          EXPECTED=$((BASE_VERSION + 1))
-          echo "Base (${BASE_REF}): v${BASE_VERSION}; PR: v${PR_VERSION}; expected on bump: v${EXPECTED}; injectable_src_changed=${INJECTABLE_SRC_CHANGED}"
+          REVISION_PATH="src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt"
+          BASE_REVISION=$(git show "origin/${BASE_REF}:${REVISION_PATH}" | tr -d '[:space:]')
+          PR_REVISION=$(tr -d '[:space:]' < "${REVISION_PATH}")
+          EXPECTED=$((BASE_REVISION + 1))
+          echo "Base (${BASE_REF}): tl${BASE_REVISION}; PR: tl${PR_REVISION}; expected on bump: tl${EXPECTED}; injectable_src_changed=${INJECTABLE_SRC_CHANGED}"
           if [ "$INJECTABLE_SRC_CHANGED" = "true" ]; then
-            if [ "$PR_VERSION" = "$EXPECTED" ]; then
+            if [ "$PR_REVISION" = "$EXPECTED" ]; then
               echo "correctly_bumped=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::src/inspect_sandbox_tools/ changed but ${VERSION_PATH} is v${PR_VERSION}; bump it to v${EXPECTED}."
+              echo "::error::src/inspect_sandbox_tools/ executable source changed but ${REVISION_PATH} is tl${PR_REVISION}; bump it to tl${EXPECTED}."
               exit 1
             fi
           else
-            if [ "$PR_VERSION" = "$BASE_VERSION" ]; then
+            if [ "$PR_REVISION" = "$BASE_REVISION" ]; then
               # Unbumped direction of the digest-pinning rule: a SHA256SUMS-only
-              # change is a re-publication of an existing version, which is
-              # forbidden (published S3 objects are immutable). Applies only when
-              # the sums file exists on the base ref so the PR that seeds the
-              # file (no bump) doesn't fail the rule it introduces. The bumped
-              # direction (sums must be rewritten) is deliberately enforced only
-              # by slow-tool-tests-release: the sums are written at post-approval
-              # upload, and a red fast gate here would block slow-tool-tests-dev
-              # for the whole review window.
+              # change is a re-publication of an existing fork revision, which is
+              # forbidden (published GitHub-release objects are immutable per
+              # revision). Applies only when the sums file exists on the base ref
+              # so the PR that seeds the file (no bump) doesn't fail the rule it
+              # introduces. The bumped direction (sums must be rewritten) is
+              # deliberately enforced only by slow-tool-tests-release: the sums
+              # are written at post-approval upload, and a red fast gate here
+              # would block slow-tool-tests-dev for the whole review window.
               SUMS_PATH="src/inspect_ai/tool/_sandbox_tools_utils/SHA256SUMS"
               if git cat-file -e "origin/${BASE_REF}:${SUMS_PATH}" 2>/dev/null && \
                  ! git diff --quiet "origin/${BASE_REF}" -- "${SUMS_PATH}"; then
-                echo "::error::${SUMS_PATH} changed but ${VERSION_PATH} is unchanged. Digests for a published version are immutable; bump the version and publish fresh artifacts instead."
+                echo "::error::${SUMS_PATH} changed but ${REVISION_PATH} is unchanged. Digests for a published fork revision are immutable; bump the revision and publish fresh artifacts instead."
                 exit 1
               fi
               echo "correctly_bumped=false" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::${VERSION_PATH} changed to v${PR_VERSION} but src/inspect_sandbox_tools/ is unchanged. Either revert the version change or include the injectable source change."
+              echo "::error::${REVISION_PATH} changed to tl${PR_REVISION} but the executable source is unchanged. Either revert the revision change or include an executable source change."
               exit 1
             fi
           fi
@@ -555,14 +551,15 @@ jobs:
         run: |
           VERSION=$(tr -d '[:space:]' < src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt)
           SUMS=src/inspect_ai/tool/_sandbox_tools_utils/SHA256SUMS
+          FORK_REVISION=$(tr -d '[:space:]' < src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt)
+          BASE_URL="${INSPECT_SANDBOX_TOOLS_BASE_URL:-https://github.com/trajectory-labs-pbc/inspect_ai/releases/download/sandbox-tools}"
           mkdir -p src/inspect_ai/binaries
-          # Digest file must be in lockstep with the version bump: four non-blank
-          # entries, all named -v${VERSION}. (Entry format/distinctness is enforced
-          # by a fast unit test.) A flag records the failure rather than an early
-          # exit: `exit 1` in the awk body jumps to END, whose own exit would
-          # override the status.
-          if ! awk -v v="v${VERSION}" 'NF { n++; if ($2 !~ ("-" v "$")) bad = 1 } END { exit (bad || n != 4) }' "$SUMS"; then
-            echo "::error::${SUMS} is not updated for v${VERSION}. Build+upload the artifacts (upload_to_s3.py rewrites it) and commit it in this PR."
+          # Digest file must have an entry for each fork artifact of the current
+          # (version, fork revision): four entries named -v${VERSION}-tl${FORK_REVISION}
+          # (the file also carries upstream's own -v${VERSION} rows, untouched by
+          # this check). Entry format/distinctness is enforced by a fast unit test.
+          if ! awk -v suf="-v${VERSION}-tl${FORK_REVISION}" '$2 ~ (suf "$") { n++ } END { exit (n != 4) }' "$SUMS"; then
+            echo "::error::${SUMS} is not updated for v${VERSION}-tl${FORK_REVISION}. Build+upload the artifacts (upload_to_github_release.py rewrites it) and commit it in this PR."
             exit 1
           fi
           # All four artifacts are fetched and digest-checked, not just the amd64
@@ -572,13 +569,11 @@ jobs:
           # digests would never be compared against S3 by anything but the
           # maintainer-run round trip. The extra ~30 MB download is trivial in CI.
           for FILENAME in \
-            "inspect-sandbox-tools-amd64-v${VERSION}" \
-            "inspect-sandbox-tools-amd64-musl-v${VERSION}" \
-            "inspect-sandbox-tools-arm64-v${VERSION}" \
-            "inspect-sandbox-tools-arm64-musl-v${VERSION}"; do
-            URL="https://inspect-sandbox-tools.s3.us-east-2.amazonaws.com/${FILENAME}"
-            # Keep today's explicit not-yet-uploaded error (a bare curl -f 404 is
-            # terse and carries no ::error annotation).
+            "inspect-sandbox-tools-amd64-v${VERSION}-tl${FORK_REVISION}" \
+            "inspect-sandbox-tools-amd64-musl-v${VERSION}-tl${FORK_REVISION}" \
+            "inspect-sandbox-tools-arm64-v${VERSION}-tl${FORK_REVISION}" \
+            "inspect-sandbox-tools-arm64-musl-v${VERSION}-tl${FORK_REVISION}"; do
+            URL="${BASE_URL}/${FILENAME}"
             if ! curl -fsI "$URL" >/dev/null; then
               echo "::error::Published binary ${FILENAME} not found at ${URL}. Run: python src/inspect_ai/tool/_sandbox_tools_utils/upload_to_s3.py ${VERSION}, commit the rewritten SHA256SUMS, then rerun this job."
               exit 1
