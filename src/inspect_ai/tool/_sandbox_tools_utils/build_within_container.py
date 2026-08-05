@@ -76,6 +76,15 @@ def read_version() -> str:
         sys.exit(1)
 
 
+def read_fork_revision() -> int:
+    revision_file = Path("./sandbox_tools_fork_revision.txt")
+    try:
+        return int(revision_file.read_text().strip())
+    except FileNotFoundError:
+        print(f"Fork revision file not found: {revision_file}", file=sys.stderr)
+        sys.exit(1)
+
+
 def detect_host_architecture() -> tuple[str, str]:
     """Detect host architecture and return (arch_suffix, platform)."""
     arch = platform.machine().lower()
@@ -158,6 +167,7 @@ def run_docker_container(
     config = SandboxToolsBuildConfig(
         arch=arch,
         version=version_num,
+        fork_rev=read_fork_revision(),
         suffix=validated_suffix,
         musl=musl,
     )

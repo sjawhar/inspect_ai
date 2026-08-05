@@ -14,6 +14,7 @@ SandboxToolsArch: TypeAlias = Literal["amd64", "arm64"]
 class SandboxToolsBuildConfig(BaseModel):
     arch: SandboxToolsArch
     version: int
+    fork_rev: int = 1
     suffix: Literal["dev"] | None
     musl: bool = False
     """Whether this is the musl-linked variant (for musl sandboxes, e.g. Alpine).
@@ -27,10 +28,10 @@ def filename_to_config(filename: str) -> SandboxToolsBuildConfig:
     """
     Parse a filename into strongly typed build configuration.
 
-    Expected pattern: inspect-sandbox-tools-{arch}[-musl]-v{version}[-{suffix}]
+    Expected pattern: inspect-sandbox-tools-{arch}[-musl]-v{version}-tl{fork_rev}[-dev]
     Version is an ordinal integer (not semantic).
     """
-    pattern = rf"^{SANDBOX_TOOLS_BASE_NAME}-(?P<arch>\w+)(?:-(?P<libc>musl))?-v(?P<version>\d+)(?:-(?P<suffix>\w+))?$"
+    pattern = rf"^{SANDBOX_TOOLS_BASE_NAME}-(?P<arch>\w+)(?:-(?P<libc>musl))?-v(?P<version>\d+)-tl(?P<fork_rev>\d+)(?:-(?P<suffix>dev))?$"
     match = re.match(pattern, filename)
     if not match:
         raise ValueError(f"Filename '{filename}' doesn't match expected pattern")
@@ -39,6 +40,7 @@ def filename_to_config(filename: str) -> SandboxToolsBuildConfig:
         {
             "arch": match.group("arch"),
             "version": int(match.group("version")),
+            "fork_rev": int(match.group("fork_rev")),
             "suffix": match.group("suffix"),
             "musl": match.group("libc") == "musl",
         }
@@ -50,7 +52,7 @@ def config_to_filename(config: SandboxToolsBuildConfig) -> str:
     base = f"{SANDBOX_TOOLS_BASE_NAME}-{config.arch}"
     if config.musl:
         base += "-musl"
-    base += f"-v{config.version}"
+    base += f"-v{config.version}-tl{config.fork_rev}"
     if config.suffix:
         base += f"-{config.suffix}"
     return base
