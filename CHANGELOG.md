@@ -73,6 +73,7 @@
 - Bugfix: Docker sandbox startup no longer times out during a healthcheck's `start_period`, so services with a long startup grace period now start reliably. (#4698)
 - Bugfix: Fractional healthcheck durations (e.g. `1.5s`) in Docker compose files now produce the correct startup timeout instead of a silently wrong one. (#4698)
 - Dependencies: Require `agent-client-protocol` >= 0.12 (adapts to its renamed multi-select schema types and new catch-all property type).
+- Model API: `model.generate()` now emits one `ModelEvent` per attempt with per-attempt timing and retry accounting (`call_id`, `attempt`, `call_retries`, `http_retries`).
 
 ## 0.3.251 (29 July 2026)
 
