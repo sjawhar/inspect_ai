@@ -54,6 +54,7 @@ class SandboxAgentBridge(AgentBridge):
         allow_remote_mcp: bool = False,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        accumulate_conversations: bool = False,
     ) -> None:
         super().__init__(
             state,
@@ -69,6 +70,7 @@ class SandboxAgentBridge(AgentBridge):
             allow_remote_mcp=allow_remote_mcp,
             allow_remote_media=allow_remote_media,
             model_resolver=model_resolver,
+            accumulate_conversations=accumulate_conversations,
         )
         self.port = port
         self.mcp_server_configs = mcp_server_configs or []
