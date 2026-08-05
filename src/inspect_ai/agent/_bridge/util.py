@@ -15,6 +15,8 @@ from inspect_ai.model._model import (
     GenerateInput,
     Model,
     ModelGenerateFilter,
+    ModelName,
+    ModelResolver,
     active_model,
     get_model,
     model_roles,
@@ -295,6 +297,27 @@ async def bridge_generate(
                     config=config,
                 )
 
+        # Apply response filter if configured.
+        # Runs inside the refusal-retry loop so a filter that returns a
+        # content_filter ModelOutput triggers a retry; the input arguments
+        # passed are the same ones sent to model.generate() (post-request-filter
+        # mutation if applicable).
+        if bridge.response_filter is not None:
+            tool_info_for_response = [
+                tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                for tool in tools
+            ]
+            filtered = await bridge.response_filter(
+                model,
+                output,
+                input_messages,
+                tool_info_for_response,
+                tool_choice,
+                config,
+            )
+            if filtered is not None:
+                output = filtered
+
         # Update the compaction baseline with the actual input token
         # count from the generate call (most accurate source of truth)
         if compact is not None:
@@ -319,7 +342,7 @@ def resolve_generate_config(
     config = bridge_config.merge(model.config)
 
     # apply active model config if appropriate
-    is_active_model = model == active_model()
+    is_active_model = model is active_model()
     if is_active_model:
         config = config.merge(active_generate_config())
 
@@ -330,9 +353,29 @@ def resolve_inspect_model(
     model_name: str,
     model_aliases: dict[str, str | Model] | None = None,
     fallback_model: str | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    provider: str = "",
 ) -> Model:
     if model_aliases and model_name in model_aliases:
         return get_model(model_aliases[model_name])
+
+    # A bare model name on a provider-specific bridge endpoint resolves to that provider (the
+    # endpoint implies it); otherwise get_model rejects the unqualified name.
+    if (
+        provider
+        and "/" not in model_name
+        and model_name != "inspect"
+        and model_name not in model_roles()
+    ):
+        model_name = f"{provider}/{model_name}"
+
+    # Dynamic routing policy: checked after explicit aliases, before the static
+    # fallback. Returning None defers to the fallback / normal resolution below.
+    if model_resolver is not None:
+        resolved = model_resolver(model_name)
+        if resolved is not None:
+            return resolved if isinstance(resolved, Model) else get_model(resolved)
 
     if fallback_model is not None:
         if model_name != "inspect" or not fallback_model.startswith("inspect/"):
@@ -344,6 +387,23 @@ def resolve_inspect_model(
     model_name = model_name.removeprefix("inspect/")
     if model_name in model_roles():
         return get_model(role=model_name)
+
+    # Prefer the eval's own Model instance when the client names it.
+    #
+    # A bridged client may send the concrete model id instead of asking for
+    # "inspect" (claude_code sends e.g. "claude-fable-5"). get_model() memoizes on a
+    # key that includes the config JSON, so resolving by name alone handed back a
+    # DIFFERENT instance than the eval's active model -- and resolve_generate_config
+    # only applies the eval's GenerateConfig to the active model, so eval-level
+    # options were silently dropped before the provider request. Returning the active
+    # instance also avoids a second Model (and its connection pool) for one model.
+    #
+    # Deliberately placed last: aliases, an explicit "inspect", and model roles all
+    # return above, so this cannot redirect a role or alias to the eval's model.
+    active = active_model()
+    if active is not None and model_name in (str(active), ModelName(active).name):
+        return active
+
     return get_model(model_name)
 
 

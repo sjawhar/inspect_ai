@@ -208,7 +208,13 @@ async def inspect_responses_api_request_impl(
 ) -> Response:
     # resolve model
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(bridge_model_name, bridge.model_aliases, bridge.model)
+    model = resolve_inspect_model(
+        bridge_model_name,
+        bridge.model_aliases,
+        bridge.model,
+        model_resolver=bridge.model_resolver,
+        provider="openai",
+    )
     model_name = model.api.model_name
     is_openai = _is_openai_responses_provider(model)
 
@@ -310,7 +316,7 @@ async def inspect_responses_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # return response
     response = Response(

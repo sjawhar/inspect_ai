@@ -34,6 +34,8 @@ def model_retry_config(
     report_waiting_time: Callable[[float], None] | None = None,
     wait: WaitBaseT | None = None,
     live_overrides: bool = True,
+    on_retry_scheduled: Callable[[RetryCallState], (Awaitable[None] | None)]
+    | None = None,
     report_retry_wait: bool = True,
 ) -> ModelRetryConfig:
     # retry for transient http errors:
@@ -57,6 +59,11 @@ def model_retry_config(
         # expire while we are waiting b/c we've already offset it)
         if report_waiting_time is not None:
             report_waiting_time(rs.upcoming_sleep)
+
+        if on_retry_scheduled is not None:
+            res = on_retry_scheduled(rs)
+            if res is not None:
+                await res
 
         # `report_retry_wait` gates the per-sample record rather than relying
         # on sample_active() alone: a batcher's admin-op retry loop runs on a

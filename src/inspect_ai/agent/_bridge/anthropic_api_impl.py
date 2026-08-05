@@ -98,7 +98,13 @@ async def inspect_anthropic_api_request_impl(
 ) -> Message | BetaMessage:
     # resolve model
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(bridge_model_name, bridge.model_aliases, bridge.model)
+    model = resolve_inspect_model(
+        bridge_model_name,
+        bridge.model_aliases,
+        bridge.model,
+        model_resolver=bridge.model_resolver,
+        provider="anthropic",
+    )
 
     # tools
     anthropic_tools: list[ToolParamDef] | None = json_data.get("tools", None)
@@ -128,14 +134,25 @@ async def inspect_anthropic_api_request_impl(
     messages = await messages_from_anthropic_input(input, tools)
     debug_log("INSPECT MESSAGES", messages)
 
-    # extract generate config (hoist instructions into system_message)
+    # extract generate config (hoist instructions into system messages)
     config = generate_config_from_anthropic(json_data)
     if not bridge.forward_generation_config:
         clear_generation_params(config)
     config.extra_headers = headers
-    if config.system_message is not None:
-        messages.insert(0, ChatMessageSystem(content=config.system_message))
-        config.system_message = None
+    # Hoist the request's `system` value into leading system messages, ONE PER
+    # ANTHROPIC BLOCK. Block boundaries are load-bearing: the API consumes a
+    # system block whose text begins with an `x-anthropic-*-header:` line as
+    # request metadata, so concatenating blocks can prepend such a header to a
+    # real instruction block and the API then discards the whole block --
+    # silently dropping the instructions. Observed with Claude Code's auto-mode
+    # security classifier, which sends `system` as
+    # [billing-header, monitor-prompt, session-context]: flattened, the 106k-char
+    # prompt billed only 253 input tokens (i.e. never arrived), leaving the
+    # classifier with no instructions and no verdict grammar.
+    system_texts = anthropic_system_to_texts(json_data.get("system"))
+    for offset, system_text in enumerate(system_texts):
+        messages.insert(offset, ChatMessageSystem(content=system_text))
+    config.system_message = None
 
     # try to maintain id stability
     apply_message_ids(bridge, messages)
@@ -153,7 +170,7 @@ async def inspect_anthropic_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # return message (use beta message type if request came from beta endpoint)
     message_class = BetaMessage if beta else Message
@@ -181,13 +198,34 @@ def debug_log(caption: str, o: Any) -> None:
 
 def anthropic_system_to_text(value: Any) -> str:
     """Flatten an Anthropic ``system`` value (``str`` or ``list[TextBlockParam]``) to text."""
+    return "\n\n".join(anthropic_system_to_texts(value))
+
+
+def anthropic_system_to_texts(value: Any) -> list[str]:
+    """Split an Anthropic ``system`` value into one text per block.
+
+    ``system`` is either a plain string or a list of ``TextBlockParam``. Callers
+    that turn these into Inspect system messages must preserve one entry per
+    block rather than concatenating: the Anthropic API treats a system block
+    beginning with an ``x-anthropic-*-header:`` line as request metadata and
+    drops that block, so gluing a header block onto an instruction block causes
+    the instructions to be discarded server-side.
+
+    Empty blocks are omitted (they carry no instructions and would otherwise
+    become empty system messages).
+    """
+    if value is None:
+        return []
     if isinstance(value, str):
-        return value
-    return "\n\n".join(
-        str(b.get("text", ""))
-        for b in value
-        if isinstance(b, dict) and b.get("type") == "text"
-    )
+        return [value] if value else []
+    texts: list[str] = []
+    for block in value:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = str(block.get("text", ""))
+        if text:
+            texts.append(text)
+    return texts
 
 
 def generate_config_from_anthropic(json_data: dict[str, Any]) -> GenerateConfig:
@@ -224,6 +262,19 @@ def generate_config_from_anthropic(json_data: dict[str, Any]) -> GenerateConfig:
     for field in anthropic_extra_body_fields():
         if field in json_data:
             extra_body[field] = json_data[field]
+
+    # Forward a client-supplied server-side fallback directive VERBATIM. Claude
+    # Code sends `fallbacks` (plus the matching `server-side-fallback` beta) so
+    # the API can serve a refused request with another model. Dropping it turns
+    # a refusal that production would transparently hand off into a dead turn:
+    # the client sees stop_reason=refusal with an empty completion, retries the
+    # same model, and the sample lands scored-but-empty. We do not reinterpret it
+    # into `fallback_models` -- that would re-serialize to `[{"model": ...}]` and
+    # drop any other field the client sent, and it is subject to Inspect's own
+    # warn-and-ignore gating. The response side records the handoff regardless
+    # (see `serving_model` / `ModelFallback` in the anthropic provider).
+    if (fallbacks := json_data.get("fallbacks")) is not None:
+        extra_body["fallbacks"] = fallbacks
     if len(extra_body) > 0:
         config.extra_body = extra_body
 

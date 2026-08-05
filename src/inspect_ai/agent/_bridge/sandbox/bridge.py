@@ -7,7 +7,13 @@ import anyio
 from shortuuid import uuid
 
 from inspect_ai.model._compaction.types import CompactionStrategy
-from inspect_ai.model._model import GenerateFilter, Model, ModelEventSink
+from inspect_ai.model._model import (
+    GenerateFilter,
+    Model,
+    ModelEventSink,
+    ModelResolver,
+    ModelResponseFilter,
+)
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.tool._mcp._tools_bridge import BridgedToolsSpec
 from inspect_ai.tool._sandbox_tools_utils.sandbox import sandbox_with_injected_tools
@@ -40,6 +46,7 @@ async def sandbox_agent_bridge(
     *,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    model_resolver: ModelResolver | None = None,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     compaction: CompactionStrategy | None = None,
@@ -51,6 +58,8 @@ async def sandbox_agent_bridge(
     model_event_sink: ModelEventSink | None = None,
     forward_generation_config: bool = False,
     checkpointer: Checkpointer | None = None,
+    accumulate_conversations: bool = False,
+    response_filter: ModelResponseFilter | None = None,
 ) -> AsyncIterator[SandboxAgentBridge]:
     """Sandbox agent bridge.
 
@@ -71,6 +80,11 @@ async def sandbox_agent_bridge(
         model_aliases: Map of model name aliases. When a request uses a name
             that appears here, the corresponding value (a ``Model`` instance
             or model spec string) is used instead. Checked before the fallback ``model``.
+        model_resolver: Dynamic routing policy called with the requested model
+            name (provider-qualified on a provider-specific endpoint, e.g.
+            ``openai/gpt-5.1``). Checked after ``model_aliases`` and before the ``model``
+            fallback; return a ``Model``/spec to route the request there, or
+            ``None`` to defer. Routes by policy without enumerating every name.
         filter: Filter for bridge model generation.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         compaction: Compact the conversation when it it is close to overflowing
@@ -110,6 +124,17 @@ async def sandbox_agent_bridge(
             state (messages, output, compaction prefix) for checkpoint backup
             and restore, so a checkpointed run survives resume. Defaults to
             `None` (no checkpointing).
+        accumulate_conversations: Keep every conversation observed over the bridge
+            rather than tracking a single main one. Defaults to `False`, which surfaces
+            the main agent loop and treats other traffic as side calls — right for a
+            scaffold that runs one loop. Set `True` when the sandbox may run SEVERAL
+            independent conversations (a human-driven harness, or repeated CLI
+            invocations): `state.messages` then holds each of them concatenated in the
+            order they started, instead of silently keeping only one.
+        response_filter: Filter that mutates model output after generation.
+            Called inside the refusal-retry loop, between ``model.generate()``
+            and the compaction baseline update. Return ``None`` to pass
+            through; return a ``ModelOutput`` to replace the response.
     """
     # instance id for this bridge
     instance = f"proxy_{uuid()}"
@@ -142,9 +167,12 @@ async def sandbox_agent_bridge(
                 port=port,
                 model=model,
                 model_aliases=model_aliases,
+                model_resolver=model_resolver,
                 model_event_sink=model_event_sink,
                 forward_generation_config=forward_generation_config,
                 checkpointer=checkpointer,
+                accumulate_conversations=accumulate_conversations,
+                response_filter=response_filter,
             )
 
             # register bridged tools with the bridge

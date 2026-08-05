@@ -1,5 +1,19 @@
 ## Unreleased
 
+- Agent Bridge: a bare model name arriving on a provider-specific bridge endpoint (`openai`/`google`/`anthropic`) now resolves to that provider (`resolve_inspect_model(..., provider=)`) instead of being rejected as unqualified, so bridge clients can send plain model names like `gpt-5.1`.
+- Agent Bridge: `agent_bridge()` and `sandbox_agent_bridge()` now accept a `response_filter` for transforming model output before it is returned.
+- Human Agent: `human_cli()` now accepts a `customize_commands` option for tailoring the commands available in the human agent CLI.
+- Model API: `model.generate()` now emits one `ModelEvent` per attempt with per-attempt timing and retry accounting (`call_id`, `attempt`, `call_retries`, `http_retries`).
+- Agent Bridge: Client-supplied HTTP headers are now forwarded through the sandbox agent-bridge model proxy to the bridged model request.
+- Agent Bridge: Bridged Anthropic requests now preserve `system` block boundaries, so instruction blocks are no longer silently discarded by the API.
+- Anthropic: A client-supplied `fallbacks` directive is now forwarded to the API verbatim instead of being dropped (skipped on bedrock/vertex/azure, which reject the field).
+- Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
+- Agent Bridge: A bridged client that sends the eval model's concrete id instead of `inspect` (claude_code sends e.g. `claude-fable-5`) now resolves to the eval's own `Model` instance rather than a second one built by `get_model()`, whose memoization key includes the config. Previously such a client got a distinct instance, and since the eval's `GenerateConfig` is only applied to the active model, eval-level options such as `fallback_models` were silently dropped before the provider request. Aliases, model roles, and any other model the client names are unaffected.
+- Agent Bridge: Image tool results now reach sandboxed agents as MCP image content instead of being flattened to text.
+- Agent Bridge: Side calls to a different model can no longer displace the tracked agent conversation, regardless of thread shape.
+- Control Channel: `inspect ctl` reads discovered processes concurrently, and `INSPECT_CTL_REQUEST_TIMEOUT` raises the per-attempt read timeout for busy evals.
+- Bugfix: MCP sandbox sessions are now cached per tool-source instance and cleared on close, so one instance's sessions and tool lists no longer leak into another's.
+- MCP: A shared `ToolSource` no longer serves one sample's tools to another; cached tools are re-resolved when the async scope changes.
 - Bugfix: Model info lookup no longer sends its internal placeholder API key to the Hugging Face Hub when canonicalizing model names. (#4600)
 - Scorer: NaN score values (scalar, dict key, or list element) now survive eval logs and realtime views instead of becoming null, being miscounted as 0.0 on `eval_set` retry, or failing log validation.
 - Eval: Multi-task runs without `task_retry_attempts` now use the same task dispatcher as runs with retries (the separate no-retry dispatcher was removed).
@@ -16,6 +30,7 @@
 - Logging: Model calls in running samples now show an end time and non-zero working time in the viewer, instead of an empty completion time and 0 seconds. (#4226)
 - Bugfix: Model-graded scorers with `include_history=True` no longer present an empty history for samples without an assistant turn; such samples may now receive parseable grades and enter the metric denominator. (#4722)
 - Hugging Face: Model info lookups now use your `HF_TOKEN` or cached `huggingface-cli login` credentials instead of authenticating with a placeholder and being rate limited as anonymous. (#4600)
+- Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
 
 ## 0.3.252 (04 August 2026)
 

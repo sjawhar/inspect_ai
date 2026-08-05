@@ -1,7 +1,13 @@
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.agent._bridge.types import AgentBridge
 from inspect_ai.model._compaction.types import CompactionStrategy
-from inspect_ai.model._model import GenerateFilter, Model, ModelEventSink
+from inspect_ai.model._model import (
+    GenerateFilter,
+    Model,
+    ModelEventSink,
+    ModelResolver,
+    ModelResponseFilter,
+)
 from inspect_ai.tool import Tool
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.util._checkpoint.checkpointer import Checkpointer
@@ -24,6 +30,9 @@ class SandboxAgentBridge(AgentBridge):
         model_event_sink: ModelEventSink | None = None,
         forward_generation_config: bool = False,
         checkpointer: Checkpointer | None = None,
+        response_filter: ModelResponseFilter | None = None,
+        accumulate_conversations: bool = False,
+        model_resolver: ModelResolver | None = None,
     ) -> None:
         super().__init__(
             state,
@@ -35,6 +44,9 @@ class SandboxAgentBridge(AgentBridge):
             model_event_sink=model_event_sink,
             forward_generation_config=forward_generation_config,
             checkpointer=checkpointer,
+            accumulate_conversations=accumulate_conversations,
+            model_resolver=model_resolver,
+            response_filter=response_filter,
         )
         self.port = port
         self.mcp_server_configs = mcp_server_configs or []
