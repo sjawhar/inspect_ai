@@ -14,6 +14,7 @@
 - Control Channel: `inspect ctl` reads discovered processes concurrently, and `INSPECT_CTL_REQUEST_TIMEOUT` raises the per-attempt read timeout for busy evals.
 - Bugfix: MCP sandbox sessions are now cached per tool-source instance and cleared on close, so one instance's sessions and tool lists no longer leak into another's.
 - MCP: A shared `ToolSource` no longer serves one sample's tools to another; cached tools are re-resolved when the async scope changes.
+- Google: Reuse one SSL context across model clients instead of rebuilding it per request, removing blocking CA-bundle reads that could stall evals at high sandbox concurrency.
 - Bugfix: Model info lookup no longer sends its internal placeholder API key to the Hugging Face Hub when canonicalizing model names. (#4600)
 - Scorer: NaN score values (scalar, dict key, or list element) now survive eval logs and realtime views instead of becoming null, being miscounted as 0.0 on `eval_set` retry, or failing log validation.
 - Eval: Multi-task runs without `task_retry_attempts` now use the same task dispatcher as runs with retries (the separate no-retry dispatcher was removed).

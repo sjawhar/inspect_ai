@@ -4,6 +4,7 @@ import functools
 import hashlib
 import json
 import os
+import ssl
 from copy import copy
 from io import BytesIO
 from logging import getLogger
@@ -903,6 +904,29 @@ class GoogleGenAIAPI(ModelAPI):
         if self._oauth and self._credentials is not None:
             await self._credentials.ensure_valid()
 
+    @staticmethod
+    @functools.cache
+    def _ssl_context() -> ssl.SSLContext:
+        """The shared SSL context for genai clients, built once per process.
+
+        `Client()` is constructed per `generate()` call (deliberately — a shared client
+        would share a principal), and each construction calls both
+        `_ensure_httpx_ssl_ctx` and `_ensure_websocket_ssl_ctx`, which build a default
+        context from `certifi.where()`. That reads and parses the CA bundle from disk
+        SYNCHRONOUSLY on the event loop, once per model call. At high sandbox
+        concurrency it showed up in py-spy dumps of a saturated runner loop, where
+        blocking work starves the sandbox-service RPC consumer.
+
+        A context carries only CA trust, not credentials, so unlike the client itself it
+        is safe to share across principals.
+        """
+        import certifi
+
+        return ssl.create_default_context(
+            cafile=os.environ.get("SSL_CERT_FILE", certifi.where()),
+            capath=os.environ.get("SSL_CERT_DIR"),
+        )
+
     def model_client(self, http_options: HttpOptions | None = None) -> Client:
         from inspect_ai._util._async import current_async_backend
 
@@ -910,6 +934,15 @@ class GoogleGenAIAPI(ModelAPI):
             base_url=self.base_url,
             api_version=self.api_version,
         )
+        # Pre-seed the SSL context genai would otherwise rebuild per client. It reads
+        # `verify` for httpx and `ssl` for the websocket transport, and skips creating
+        # one when either is already present.
+        async_client_args = dict(http_options.async_client_args or {})
+        if "verify" not in async_client_args or "ssl" not in async_client_args:
+            context = self._ssl_context()
+            async_client_args.setdefault("verify", context)
+            async_client_args.setdefault("ssl", context)
+            http_options.async_client_args = async_client_args
         # aiohttp requires asyncio; use httpx under trio for compatibility
         if (
             current_async_backend() == "trio"
