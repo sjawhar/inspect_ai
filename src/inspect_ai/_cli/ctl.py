@@ -36,6 +36,7 @@ import json as json_lib
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1865,6 +1866,76 @@ class _SampleRows(NamedTuple):
     truncated: bool
 
 
+class _FetchedPage(NamedTuple):
+    """One target's sample read: the page, or the error it raised.
+
+    Carries the exception rather than raising it in the worker so the caller can
+    re-raise it in target order, keeping error handling (which exits, warns, or skips
+    depending on whether the read was scoped) on the main thread.
+    """
+
+    page: _SamplesPage | None
+    error: _ServerUnreachable | None
+
+    def unwrap(self) -> _SamplesPage:
+        if self.error is not None:
+            raise self.error
+        assert self.page is not None
+        return self.page
+
+
+def _fetch_samples_fanout(
+    targets: list[dict[str, Any]],
+    active_since: float | None,
+    *,
+    sample_filter: Literal["errors"] | None,
+    status_param: str | None,
+    limit: int | None,
+    all_samples: bool,
+    scoped: bool,
+) -> list[_FetchedPage]:
+    """Read every target's samples concurrently, returning results in target order.
+
+    Each read is a blocking round-trip to that eval's socket, so reading targets one
+    at a time cost one full latency per running eval: `sample list` measured 23s
+    across 77 running tasks, which makes the channel unusable on exactly the large
+    sweep it exists to observe. Only the I/O overlaps -- results come back in
+    `targets` order, so row ordering, the counts histogram, the truncation flag and
+    the skip warnings are all produced exactly as a sequential read produced them.
+
+    A single target (the scoped case) is read inline, leaving the common
+    `inspect ctl sample show`-style path free of thread-pool setup.
+    """
+
+    def fetch(target: dict[str, Any]) -> _FetchedPage:
+        try:
+            return _FetchedPage(
+                _fetch_samples(
+                    target["socket_path"],
+                    target["eval_id"],
+                    active_since,
+                    sample_filter=sample_filter,
+                    status=status_param,
+                    limit=limit,
+                    all_samples=all_samples,
+                    # a scoped read fails the command on busy, so it keeps the
+                    # full budget; the unscoped fan-out skips on the default
+                    attempts=_REQUEST_ATTEMPTS if scoped else None,
+                ),
+                None,
+            )
+        except _ServerUnreachable as exc:
+            return _FetchedPage(None, exc)
+
+    if len(targets) <= 1:
+        return [fetch(target) for target in targets]
+
+    with ThreadPoolExecutor(
+        max_workers=min(len(targets), _FANOUT_MAX_WORKERS)
+    ) as executor:
+        return list(executor.map(fetch, targets))
+
+
 def _list_sample_rows(
     task: str | None,
     active_since: float | None,
@@ -1907,22 +1978,18 @@ def _list_sample_rows(
     as_of_values: list[float] = []
     read: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
-    for target in targets:
-        # Query by the task's current eval id (resolved fresh each invocation,
-        # so this still works after a retry minted a new one).
+    pages = _fetch_samples_fanout(
+        targets,
+        active_since,
+        sample_filter=sample_filter,
+        status_param=status_param,
+        limit=limit,
+        all_samples=all_samples,
+        scoped=task is not None,
+    )
+    for target, fetched_page in zip(targets, pages):
         try:
-            page = _fetch_samples(
-                target["socket_path"],
-                target["eval_id"],
-                active_since,
-                sample_filter=sample_filter,
-                status=status_param,
-                limit=limit,
-                all_samples=all_samples,
-                # a scoped read fails the command on busy, so it keeps the
-                # full budget; the unscoped fan-out skips on the default
-                attempts=_REQUEST_ATTEMPTS if task is not None else None,
-            )
+            page = fetched_page.unwrap()
         except _ServerUnreachable as exc:
             if task is not None:
                 _exit_samples_unreachable(target["eval_id"], exc, pid=target.get("pid"))
@@ -4066,6 +4133,10 @@ def _resolve_target_server(pid: int | None) -> DiscoveredControlServer:
 # than silently reporting the eval as gone.
 _REQUEST_TIMEOUT = 15.0
 _REQUEST_ATTEMPTS = 8
+
+# Cap on concurrent per-eval sample reads. Each is one blocking socket round-trip, so
+# this bounds sockets and threads while still collapsing the fan-out latency.
+_FANOUT_MAX_WORKERS = 32
 
 # Default attempt budget for ``raise_on_busy`` reads (the pairing is resolved
 # in `_get_response_with_retry`): enough to ride out a momentary stall without

@@ -4,6 +4,7 @@
 - Scorer: NaN score values (scalar, dict key, or list element) now survive eval logs and realtime views instead of becoming null, being miscounted as 0.0 on `eval_set` retry, or failing log validation.
 - Eval: Multi-task runs without `task_retry_attempts` now use the same task dispatcher as runs with retries (the separate no-retry dispatcher was removed).
 - Control Channel: `inspect ctl sample events --full` now pretty-prints the raw events instead of rendering a mostly-empty summary table.
+- Control Channel: `inspect ctl sample list`/`errors` now read running evals concurrently, so listings stay responsive on runs with many tasks instead of taking seconds per eval.
 - Control Channel: New `inspect ctl sample messages TASK SID [EPOCH]` reads a running (or buffered-but-unlogged) sample's current conversation as a snapshot, with `--tail`/`--all`/`--full`.
 - Control Channel: New `inspect ctl task pause|resume` and `inspect ctl process pause|resume` commands pause a running eval or eval-set (in-flight samples finish; nothing new starts) and resume it in place, with `paused`/`quiesced` reported by `inspect ctl task list`.
 - Scoring: `f1()` and `exact()` now match decimal-number answers wrapped in punctuation (e.g. "(3.14)" or a trailing period) against bare-number targets. (#4620)- DeepSeek: New native `deepseek` provider with support for DeepSeek V4 models (`deepseek/deepseek-v4-pro` and `deepseek/deepseek-v4-flash`), including thinking control via `--reasoning-effort`.

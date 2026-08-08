@@ -9,6 +9,7 @@ cursor validation), and rendering helpers.
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import click
@@ -5245,3 +5246,85 @@ def test_process_anomalies_accepts_group_level_json(trace_dir: Path) -> None:
     result = cli_runner().invoke(ctl_command, ["process", "--json", "anomalies", "123"])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["processes"][0]["pid"] == 123
+
+
+def test_sample_fanout_is_concurrent_and_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targets are read concurrently but folded back in `targets` order.
+
+    Ordering matters as much as speed: rows, the counts histogram and the skip
+    warnings are all produced by walking targets in order, so a fan-out that
+    returned completion-ordered results would silently reshuffle the listing.
+    """
+    import time as _time
+
+    from inspect_ai._cli.ctl import _fetch_samples_fanout
+
+    delay = 0.2
+    targets = [
+        {"socket_path": f"/tmp/{i}.sock", "eval_id": f"eval-{i}", "pid": i}
+        for i in range(8)
+    ]
+
+    def slow_fetch(socket_path: str, eval_id: str, *args: Any, **kwargs: Any) -> Any:
+        _time.sleep(delay)
+        return SimpleNamespace(
+            as_of=1.0, samples=[{"id": eval_id}], counts=None, truncated=False
+        )
+
+    monkeypatch.setattr("inspect_ai._cli.ctl._fetch_samples", slow_fetch)
+
+    start = _time.monotonic()
+    pages = _fetch_samples_fanout(
+        targets,
+        None,
+        sample_filter=None,
+        status_param=None,
+        limit=None,
+        all_samples=False,
+        scoped=False,
+    )
+    elapsed = _time.monotonic() - start
+
+    # order follows `targets`, not completion
+    assert [p.unwrap().samples[0]["id"] for p in pages] == [
+        f"eval-{i}" for i in range(8)
+    ]
+    # concurrent: well under the 8 x delay a sequential read would cost
+    assert elapsed < delay * 4, f"fan-out took {elapsed:.2f}s, expected concurrency"
+
+
+def test_sample_fanout_reports_errors_in_target_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing target yields its exception for the caller to raise in order."""
+    from inspect_ai._cli.ctl import _fetch_samples_fanout, _ServerUnreachable
+
+    targets = [
+        {"socket_path": f"/tmp/{i}.sock", "eval_id": f"eval-{i}"} for i in range(3)
+    ]
+
+    def flaky(socket_path: str, eval_id: str, *args: Any, **kwargs: Any) -> Any:
+        if eval_id == "eval-1":
+            raise _ServerUnreachable("gone")
+        return SimpleNamespace(
+            as_of=1.0, samples=[{"id": eval_id}], counts=None, truncated=False
+        )
+
+    monkeypatch.setattr("inspect_ai._cli.ctl._fetch_samples", flaky)
+
+    pages = _fetch_samples_fanout(
+        targets,
+        None,
+        sample_filter=None,
+        status_param=None,
+        limit=None,
+        all_samples=False,
+        scoped=False,
+    )
+    assert pages[0].error is None
+    assert isinstance(pages[1].error, _ServerUnreachable)
+    assert pages[2].error is None
+    with pytest.raises(_ServerUnreachable):
+        pages[1].unwrap()
