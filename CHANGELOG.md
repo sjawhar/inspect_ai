@@ -64,6 +64,7 @@
 - Mistral: Requests are no longer capped at the SDK's flat 5s timeout, which cut off generations that took longer.
 - Hugging Face: Chat templates that use dict methods (e.g. Gemma's `message.get(...)`) no longer fail with a Jinja `UndefinedError`.
 - Sandbox: When remote exec polling exhausts its retries, the error now names the sandbox's actual failure instead of an opaque tenacity RetryError.
+- Google: Reuse one SSL context across model clients, including bridged agent calls, instead of rebuilding it per request, removing blocking CA-bundle reads that could stall evals at high sandbox concurrency.
 
 ## 0.3.260 (21 August 2026)
 
