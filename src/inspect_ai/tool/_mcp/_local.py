@@ -100,14 +100,12 @@ class MCPServerLocal(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
-        # Per-instance session table. Keyed on anyio task id, which is
-        # id(asyncio.current_task()) — a memory address that Python recycles
-        # once the task is GC'd. Storing this on the instance (rather than
-        # the class) means task-id collisions across different MCPServerLocal
-        # instances can't leak one sample's cached session — including its
-        # cached tool list — into another sample that happens to run on a
-        # reused task id.
-        self._task_sessions: dict[str, "MCPServerLocalSession"] = {}
+        # Per-instance session table keyed by scope (see _session_scope): the
+        # running sample attempt when there is one, else the current anyio
+        # task. Storing it on the instance (rather than the class) means a
+        # recycled task id in the fallback path can't leak one sample's cached
+        # session — including its cached tool list — into another sample.
+        self._task_sessions: dict[object, "MCPServerLocalSession"] = {}
 
     @override
     async def __aenter__(self) -> MCPServer:
@@ -126,9 +124,40 @@ class MCPServerLocal(MCPServer):
     async def tools(self) -> list[Tool]:
         return await self._task_session().tools()
 
+    def _session_scope(self) -> object:
+        """Identity that owns one server process.
+
+        The running **sample attempt** (``ActiveSample``), when there is one.
+        A stdio MCP server is a process inside that sample's sandbox, so the
+        sample attempt is its natural lifetime — and it is the isolation
+        boundary that matters: distinct attempts (concurrent epochs, retries)
+        get distinct objects, so tools can never bind across samples.
+
+        Keying on the current anyio task instead made every task that touched
+        the tool source miss the table and launch another server: the agent
+        bridge serves each tool call from its own task, so one sample paid the
+        exec+import+handshake cost 8-9 times (measured in-sandbox), which is a
+        large share of the event-loop starvation seen at hundreds of concurrent
+        sandboxes. Bridge request tasks descend from the sample's task group,
+        so they observe the same ActiveSample and now share its session.
+
+        A *completed* ActiveSample is not a valid scope: a child task that
+        outlives its sample must not resurrect a server in a torn-down sandbox.
+        Such a task falls back to task scope and fails against a closed
+        session, which is the intended loud failure.
+
+        Outside a sample (bare ``mcp_connection`` in tests or tooling) the
+        current anyio task is the scope, preserving the previous behaviour.
+        """
+        from inspect_ai.log._samples import sample_active
+
+        active = sample_active()
+        if active is not None and active.completed is None:
+            return active
+        return anyio.get_current_task().id
+
     def _task_session(self) -> "MCPServerLocalSession":
-        task_id = anyio.get_current_task().id
-        session_key = f"{task_id}_{self._name}"
+        session_key = (self._session_scope(), self._name)
         session = self._task_sessions.get(session_key)
         if session is None:
             session = MCPServerLocalSession(
@@ -161,8 +190,8 @@ class MCPServerLocalSession(MCPServer):
         name: str,
         events: bool,
         timeout: int | None = None,
-        cache_key: str | None = None,
-        task_sessions: dict[str, "MCPServerLocalSession"] | None = None,
+        cache_key: object | None = None,
+        task_sessions: dict[object, "MCPServerLocalSession"] | None = None,
     ) -> None:
         super().__init__()
         self._refcount = 0
