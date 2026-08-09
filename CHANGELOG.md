@@ -1,6 +1,8 @@
 ## Unreleased
 
 - Eval: added opt-in `INSPECT_GC_MODE=low_latency` to suppress automatic full collections during high-concurrency runs while retaining a cgroup-memory guard.
+- MCP: a sandboxed MCP server is now started once per sample instead of once per tool call, so an eval with many concurrent samples no longer spends most of its time on server startup and handshakes.
+- Task: added `sample_resources`, async context managers held open for a whole sample (entered once its sandbox exists, exited after scoring) — use it to pay for a per-sample connection or process once rather than per solver.
 - Eval Log: Sample summaries now keep `Score.reason`, so an explicit reason is no longer dropped (and a stale `metadata["unscored_reason"]` cannot replace it).
 - Agent bridge: A Chat Completions response truncated by the output-token limit now reports `finish_reason="length"` instead of `"stop"`.
 - Google: Batched evaluations with a system message now serialize `system_instruction` as REST `Content` instead of a bare JSON array, fixing batch submission failures; batch results are now parsed through the SDK converter so unknown REST fields (e.g. `usageMetadata.serviceTier`) no longer fail the whole batch. (#5100)
