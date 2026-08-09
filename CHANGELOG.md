@@ -4,6 +4,8 @@
 - Agent Bridge: `agent_bridge()` and `sandbox_agent_bridge()` now accept a `response_filter` for transforming model output before it is returned.
 - Human Agent: `human_cli()` now accepts a `customize_commands` option for tailoring the commands available in the human agent CLI.
 - Model API: `model.generate()` now emits one `ModelEvent` per attempt with per-attempt timing and retry accounting (`call_id`, `attempt`, `call_retries`, `http_retries`).
+- MCP: a sandboxed MCP server is now started once per sample instead of once per tool call, so an eval with many concurrent samples no longer spends most of its time on server startup and handshakes.
+- Task: added `sample_resources`, async context managers held open for a whole sample (entered once its sandbox exists, exited after scoring) — use it to pay for a per-sample connection or process once rather than per solver.
 - Agent Bridge: Client-supplied HTTP headers are now forwarded through the sandbox agent-bridge model proxy to the bridged model request.
 - Agent Bridge: Bridged Anthropic requests now preserve `system` block boundaries, so instruction blocks are no longer silently discarded by the API.
 - Anthropic: A client-supplied `fallbacks` directive is now forwarded to the API verbatim instead of being dropped (skipped on bedrock/vertex/azure, which reject the field).
