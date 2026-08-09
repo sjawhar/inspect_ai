@@ -937,12 +937,25 @@ class GoogleGenAIAPI(ModelAPI):
         # Pre-seed the SSL context genai would otherwise rebuild per client. It reads
         # `verify` for httpx and `ssl` for the websocket transport, and skips creating
         # one when either is already present.
+        #
+        # Seed BOTH dicts. genai resolves the context with
+        #     args.get(verify) if args else None or async_args.get(verify) if async_args
+        # which parses as
+        #     args.get(v) if args else ((None or async_args.get(v)) if async_args else None)
+        # so a non-empty `client_args` makes it read the SYNC dict and never consult the
+        # async one. The bridge passes `client_args`, so seeding only the async dict
+        # missed there and genai rebuilt the context on the event loop -- observed with
+        # py-spy as create_default_context under bridge_generate on a live run.
+        context = self._ssl_context()
         async_client_args = dict(http_options.async_client_args or {})
         if "verify" not in async_client_args or "ssl" not in async_client_args:
-            context = self._ssl_context()
             async_client_args.setdefault("verify", context)
             async_client_args.setdefault("ssl", context)
             http_options.async_client_args = async_client_args
+        client_args = dict(http_options.client_args or {})
+        if "verify" not in client_args:
+            client_args["verify"] = context
+            http_options.client_args = client_args
         # aiohttp requires asyncio; use httpx under trio for compatibility
         if (
             current_async_backend() == "trio"
