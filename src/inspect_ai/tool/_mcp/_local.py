@@ -100,14 +100,12 @@ class MCPServerLocal(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
-        # Per-instance session table. Keyed on anyio task id, which is
-        # id(asyncio.current_task()) — a memory address that Python recycles
-        # once the task is GC'd. Storing this on the instance (rather than
-        # the class) means task-id collisions across different MCPServerLocal
-        # instances can't leak one sample's cached session — including its
-        # cached tool list — into another sample that happens to run on a
-        # reused task id.
-        self._task_sessions: dict[str, "MCPServerLocalSession"] = {}
+        # Per-instance session table keyed by scope (see _session_scope): the
+        # running sample attempt when there is one, else the current anyio
+        # task. Storing it on the instance (rather than the class) means a
+        # recycled task id in the fallback path can't leak one sample's cached
+        # session — including its cached tool list — into another sample.
+        self._task_sessions: dict[object, "MCPServerLocalSession"] = {}
 
     @override
     async def __aenter__(self) -> MCPServer:
@@ -126,17 +124,62 @@ class MCPServerLocal(MCPServer):
     async def tools(self) -> list[Tool]:
         return await self._task_session().tools()
 
+    def _session_scope(self) -> object:
+        """Identity that owns one server process.
+
+        The running **sample attempt** (``ActiveSample``), when there is one.
+        A stdio MCP server is a process inside that sample's sandbox, so the
+        sample attempt is its natural lifetime — and it is the isolation
+        boundary that matters: distinct attempts (concurrent epochs, retries)
+        get distinct objects, so tools can never bind across samples.
+
+        Keying on the current anyio task instead made every task that touched
+        the tool source miss the table and launch another server: the agent
+        bridge serves each tool call from its own task, so one sample paid the
+        exec+import+handshake cost 8-9 times (measured in-sandbox), which is a
+        large share of the event-loop starvation seen at hundreds of concurrent
+        sandboxes. Bridge request tasks descend from the sample's task group,
+        so they observe the same ActiveSample and now share its session.
+
+        A *completed* ActiveSample is not a valid scope: a child task that
+        outlives its sample must not resurrect a server in a torn-down sandbox.
+        Such a task falls back to task scope and fails against a closed
+        session, which is the intended loud failure.
+
+        Outside a sample (bare ``mcp_connection`` in tests or tooling) the
+        current anyio task is the scope, preserving the previous behaviour.
+        """
+        from inspect_ai.log._samples import sample_active
+
+        active = sample_active()
+        if active is not None and active.completed is None:
+            return active
+        return anyio.get_current_task().id
+
     def _task_session(self) -> "MCPServerLocalSession":
-        task_id = anyio.get_current_task().id
-        session_key = f"{task_id}_{self._name}"
-        if session_key not in self._task_sessions:
-            self._task_sessions[session_key] = MCPServerLocalSession(
+        session_key = (self._session_scope(), self._name)
+        session = self._task_sessions.get(session_key)
+        if session is None:
+            session = MCPServerLocalSession(
                 self._client,
                 name=self._name,
                 events=self._events,
                 timeout=self._timeout,
+                cache_key=session_key,
+                task_sessions=self._task_sessions,
             )
-        return self._task_sessions[session_key]
+            self._task_sessions[session_key] = session
+        return session
+
+    def _tool_cache_scope(self) -> object:
+        # Cache token for MCPToolSourceLocal: the per-task session OBJECT.
+        # anyio's TaskInfo.id is id()-based on asyncio and can be reused once
+        # an earlier task is garbage collected, so a raw task id is not unique
+        # over time. Sessions evict themselves from _task_sessions when they
+        # close, so a reused task id yields a fresh session object and the
+        # tool source re-resolves rather than serving tools bound to a dead
+        # session.
+        return self._task_session()
 
 
 class MCPServerLocalSession(MCPServer):
@@ -147,6 +190,8 @@ class MCPServerLocalSession(MCPServer):
         name: str,
         events: bool,
         timeout: int | None = None,
+        cache_key: object | None = None,
+        task_sessions: dict[object, "MCPServerLocalSession"] | None = None,
     ) -> None:
         super().__init__()
         self._refcount = 0
@@ -154,6 +199,8 @@ class MCPServerLocalSession(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
+        self._cache_key = cache_key
+        self._task_sessions = task_sessions
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_tool_list: list[MCPTool] | None = None
@@ -166,20 +213,30 @@ class MCPServerLocalSession(MCPServer):
         else:
             assert self._refcount == 0
             self._exit_stack = AsyncExitStack()
-            await self._exit_stack.__aenter__()
-            with trace_action(logger, "MCPServer", f"create client ({self._name})"):
-                read, write, *_ = await self._exit_stack.enter_async_context(
-                    self._client()
-                )
-            with trace_action(logger, "MCPServer", f"create session ({self._name})"):
-                self._session = await self._exit_stack.enter_async_context(
-                    ClientSession(read, write, sampling_callback=self._sampling_fn())
-                )
-            with trace_action(
-                logger, "MCPServer", f"initialize session ({self._name})"
-            ):
-                await self._session.initialize()
-            self._refcount = 1
+            try:
+                await self._exit_stack.__aenter__()
+                with trace_action(logger, "MCPServer", f"create client ({self._name})"):
+                    read, write, *_ = await self._exit_stack.enter_async_context(
+                        self._client()
+                    )
+                with trace_action(
+                    logger, "MCPServer", f"create session ({self._name})"
+                ):
+                    self._session = await self._exit_stack.enter_async_context(
+                        ClientSession(
+                            read, write, sampling_callback=self._sampling_fn()
+                        )
+                    )
+                with trace_action(
+                    logger, "MCPServer", f"initialize session ({self._name})"
+                ):
+                    await self._session.initialize()
+                self._refcount = 1
+            except BaseException:
+                # a partially-created session must not stay registered under
+                # the task id: a later task reusing the id would adopt it
+                await self._close_and_evict()
+                raise
 
         return self
 
@@ -196,16 +253,28 @@ class MCPServerLocalSession(MCPServer):
             with trace_action(logger, "MCPServer", f"disconnect ({self._name})"):
                 assert self._session is not None
                 assert self._exit_stack is not None
-                try:
-                    await self._exit_stack.aclose()
-                finally:
-                    self._session = None
-                    self._exit_stack = None
-                    # Drop the cached tool list so a reused session object
-                    # (e.g., if an outer cache hands this instance to a
-                    # different sample) re-fetches tools from the server on
-                    # next __aenter__ rather than returning a stale list.
-                    self._cached_tool_list = None
+                await self._close_and_evict()
+
+    async def _close_and_evict(self) -> None:
+        # Close the session and drop it from the per-task registry. Eviction
+        # matters because task ids can be reused after a task is collected
+        # (id()-based on asyncio): without it, a later task landing on a
+        # reused id would find this closed session and its stale cached tool
+        # list. The identity check guards against evicting a replacement
+        # registered under the same key.
+        try:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+        finally:
+            self._session = None
+            self._exit_stack = None
+            self._cached_tool_list = None
+            if (
+                self._task_sessions is not None
+                and self._cache_key is not None
+                and self._task_sessions.get(self._cache_key) is self
+            ):
+                del self._task_sessions[self._cache_key]
 
     @override
     async def tools(self) -> list[Tool]:
