@@ -60,6 +60,7 @@ from inspect_ai._util.event_loop_monitor import (
     loop_attribution_enabled,
 )
 from inspect_ai._util.file import absolute_file_path, filesystem
+from inspect_ai._util.gc_tuning import configure_gc
 from inspect_ai._util.log_context import set_run_shape
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.platform import platform_init
@@ -1006,6 +1007,7 @@ async def _eval_async_inner(
         )
         enqueuer: TaskEnqueuer = create_task_enqueuer(run_id, resolve_added_tasks)
         enqueuer_token = register_task_enqueuer(enqueuer)
+        configure_gc()
 
         async with (
             control_server(run_id=run_id, enabled=ctl.enabled) as _ctl_server,
