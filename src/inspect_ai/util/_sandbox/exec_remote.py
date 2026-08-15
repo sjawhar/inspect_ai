@@ -412,6 +412,11 @@ class ExecRemoteProcess:
             wait=wait_exponential_jitter(initial=2),
             stop=(stop_after_attempt(5) | stop_after_delay(30)),
             retry=retry_if_exception(lambda e: isinstance(e, RuntimeError)),
+            # Raise the last RuntimeError rather than a RetryError wrapping it:
+            # RetryError renders as `RetryError[<Future ... raised RuntimeError>]`,
+            # dropping the transport's diagnostic (which sandbox exec failed, and
+            # why) at the point a caller most needs it.
+            reraise=True,
         )
         async def poll() -> _PollResult:
             from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy

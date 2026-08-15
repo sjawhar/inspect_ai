@@ -260,6 +260,54 @@ class TestKill:
 
 
 # ============================================================================
+# Poll retry exhaustion
+# ============================================================================
+
+
+class TestPollRetryExhaustion:
+    async def test_exhaustion_preserves_underlying_cause(self) -> None:
+        """Poll exhaustion must surface the cause, not a bare RetryError.
+
+        `_poll` retries RuntimeError for up to 5 attempts / 30s. When the sandbox
+        is persistently unreachable the budget runs out, and tenacity's RetryError
+        carries the failed Future rather than the error message: a 15-hour eval
+        died with `RetryError(<Future at 0x... state=finished raised RuntimeError>)`
+        and no way to tell a dead container from a hung service. The transport's
+        diagnostic must reach the caller.
+        """
+        detail = "Sandbox.exec failure executing exec_remote_poll: command terminated with exit code 137"
+
+        sandbox = AsyncMock()
+        sandbox.default_polling_interval.return_value = 5
+        sandbox.no_events = _no_events_context
+
+        call_count = 0
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return ExecResult(
+                    success=True, returncode=0, stdout=_start_response(), stderr=""
+                )
+            # Every poll fails the way the JSON-RPC transport reports a
+            # non-zero sandbox exec: a RuntimeError carrying the diagnostic.
+            raise RuntimeError(detail)
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+
+        proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            _ = [event async for event in proc]
+
+        assert detail in str(exc_info.value), (
+            "poll exhaustion must surface the underlying diagnostic, got: "
+            f"{exc_info.value!r}"
+        )
+
+
+# ============================================================================
 # Cancellation
 # ============================================================================
 
