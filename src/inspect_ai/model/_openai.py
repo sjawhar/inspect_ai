@@ -1161,6 +1161,46 @@ def openai_classify_retry(ex: BaseException) -> "RetryDecision | None":
     return None
 
 
+def openai_error_stop(
+    code: str | None, type: str | None, message: str
+) -> tuple[StopReason, StopDetails | None] | None:
+    """Map an OpenAI error (code/type/message) to a terminal stop, or None.
+
+    Content-policy refusals (including gpt-5's `cyber_policy`) and length
+    overflows are terminal, non-retryable outcomes -- they must surface as a
+    finished `ModelOutput` with the right `stop_reason`, never as a raised
+    exception. A raised exception propagates through the agent bridge as a
+    transport error, and a bridged CLI (e.g. Codex) then re-issues the identical
+    request in a tight loop -- a refusal storm. Returning `None` here means "not
+    a terminal outcome", so the caller falls back to its normal error handling.
+
+    Shared by both surfaces that see these errors: the HTTP 4xx path
+    (`openai_handle_bad_request`, an `APIStatusError`) and the Responses API
+    in-body error path (a 200 whose `response.error` is populated). Keeping the
+    mapping in one place is what stops the two from drifting -- the in-body path
+    historically only recognized `invalid_prompt`, so `cyber_policy` leaked
+    through as a raise and produced exactly that storm.
+    """
+    if code == "context_length_exceeded":
+        return "model_length", None
+    if (
+        code == "invalid_prompt"  # seems to happen for o1/o3
+        or code == "content_policy_violation"  # seems to happen for vision
+        or code == "content_filter"  # seems to happen on azure
+        or code == "cyber_policy"  # seems to happen for 5.4
+        or (type == "invalid_request_error" and "blocked" in message)
+    ):
+        if code == "cyber_policy":
+            return "content_filter", StopDetails(
+                type="refusal",
+                category="cyber",
+                explanation=message,
+                categories=[StopCategory(category="cyber")],
+            )
+        return "content_filter", StopDetails(type="refusal", explanation=message)
+    return None
+
+
 def openai_handle_bad_request(
     model_name: str, e: APIStatusError
 ) -> ModelOutput | Exception:
@@ -1170,30 +1210,9 @@ def openai_handle_bad_request(
     else:
         content = e.message
 
-    # narrow stop_reason
-    stop_reason: StopReason | None = None
-    stop_details: StopDetails | None = None
-    if e.code == "context_length_exceeded":
-        stop_reason = "model_length"
-    elif (
-        e.code == "invalid_prompt"  # seems to happen for o1/o3
-        or e.code == "content_policy_violation"  # seems to happen for vision
-        or e.code == "content_filter"  # seems to happen on azure
-        or e.code == "cyber_policy"  # seems to happen for 5.4
-        or (e.type == "invalid_request_error" and "blocked" in e.message)
-    ):
-        stop_reason = "content_filter"
-        if e.code == "cyber_policy":
-            stop_details = StopDetails(
-                type="refusal",
-                category="cyber",
-                explanation=content,
-                categories=[StopCategory(category="cyber")],
-            )
-        else:
-            stop_details = StopDetails(type="refusal", explanation=content)
-
-    if stop_reason:
+    stop = openai_error_stop(e.code, e.type, content)
+    if stop is not None:
+        stop_reason, stop_details = stop
         return ModelOutput.from_content(
             model=model_name,
             content=content,

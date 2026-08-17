@@ -40,6 +40,7 @@ from .._model_call import ModelCall, as_error_response
 from .._model_output import ModelOutput, ModelUsage
 from .._openai import (
     OpenAIResponseError,
+    openai_error_stop,
     openai_handle_bad_request,
     openai_media_filter,
 )
@@ -182,8 +183,20 @@ async def generate_responses(
 
         # check for error
         if model_response.error is not None:
-            # check for content filter
-            if model_response.error.code == "invalid_prompt":
+            # A refusal / policy block (e.g. `cyber_policy` on gpt-5) or a length
+            # overflow is a terminal, non-retryable outcome -- return it as a
+            # finished ModelOutput so it flows through the agent bridge as a clean
+            # refusal instead of a raised exception. Raising here makes a bridged
+            # CLI (Codex) re-issue the identical request in a tight loop. This is
+            # the same mapping the HTTP 4xx path uses (openai_handle_bad_request);
+            # sharing it keeps the two surfaces from drifting.
+            stop = openai_error_stop(
+                model_response.error.code,
+                getattr(model_response.error, "type", None),
+                model_response.error.message,
+            )
+            if stop is not None:
+                stop_reason, stop_details = stop
                 model_call.set_error(
                     as_error_response(model_response.error),
                     http_hooks.end_request(request_id),
@@ -191,7 +204,8 @@ async def generate_responses(
                 return ModelOutput.from_content(
                     model=model_name,
                     content=model_response.error.message,
-                    stop_reason="content_filter",
+                    stop_reason=stop_reason,
+                    stop_details=stop_details,
                 ), model_call
             else:
                 raise OpenAIResponseError(
