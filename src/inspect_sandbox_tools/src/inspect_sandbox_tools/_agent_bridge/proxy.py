@@ -26,6 +26,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 RequestHandler: TypeAlias = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 RouteMap: TypeAlias = dict[str, RequestHandler]
 MethodRoutes: TypeAlias = dict[str, RouteMap]
+JsonValue: TypeAlias = (
+    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+)
+
 
 # ---------- Limits / Defaults ----------
 MAX_HEADER_BYTES = 64 * 1024
@@ -701,7 +705,7 @@ async def model_proxy_server(
             stream = json_body.get("stream", False)
 
             completion = await call_bridge_model_service_async(
-                "generate_responses", json_data=json_body
+                "generate_responses", json_data=json_body, headers=request["headers"]
             )
 
             error = _provider_error(completion)
@@ -1434,7 +1438,7 @@ async def model_proxy_server(
             json_body["parallel_tool_calls"] = False
 
             completion = await call_bridge_model_service_async(
-                "generate_completions", json_data=json_body
+                "generate_completions", json_data=json_body, headers=request["headers"]
             )
 
             error = _provider_error(completion)
@@ -1683,7 +1687,9 @@ async def model_proxy_server(
                     PING_INTERVAL_S = 5.0
                     task = asyncio.create_task(
                         call_bridge_model_service_async(
-                            "generate_anthropic", json_data=json_body
+                            "generate_anthropic",
+                            json_data=json_body,
+                            headers=request["headers"],
                         )
                     )
                     try:
@@ -1998,7 +2004,9 @@ async def model_proxy_server(
                 }
             else:
                 completion = await call_bridge_model_service_async(
-                    "generate_anthropic", json_data=json_body
+                    "generate_anthropic",
+                    json_data=json_body,
+                    headers=request["headers"],
                 )
                 error = _provider_error(completion)
                 if error is not None:
@@ -2178,7 +2186,7 @@ async def model_proxy_server(
                     arguments=arguments,
                 )
                 return _jsonrpc_response(
-                    req_id, {"content": [{"type": "text", "text": result}]}
+                    req_id, {"content": _mcp_tool_result_content(result)}
                 )
 
             else:
@@ -2193,6 +2201,18 @@ async def model_proxy_server(
 
     # return configured server
     return server
+
+
+def _mcp_tool_result_content(result: JsonValue) -> JsonValue:
+    match result:
+        case str():
+            return [{"type": "text", "text": result}]
+        case _:
+            return _mcp_tool_content_block(result)
+
+
+def _mcp_tool_content_block(content: JsonValue) -> JsonValue:
+    return content
 
 
 async def run_model_proxy_server() -> None:

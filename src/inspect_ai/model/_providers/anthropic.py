@@ -1105,6 +1105,24 @@ class AnthropicAPI(ModelAPI):
             # pass through context_management for compaction
             if CONTEXT_MANAGEMENT in config.extra_body:
                 extra_body[CONTEXT_MANAGEMENT] = config.extra_body[CONTEXT_MANAGEMENT]
+            # Pass through a caller-supplied `fallbacks` directive verbatim (the
+            # agent bridge forwards Claude Code's own server-side fallback
+            # request this way). `config.fallback_models` above already wrote
+            # this key, so an explicit Inspect-level setting wins; otherwise the
+            # client's directive is honoured untouched. The beta is appended here
+            # rather than relying on the caller's `anthropic-beta` header, so the
+            # directive cannot be silently ignored by the API. Skipped on
+            # bedrock/vertex/azure, which do not accept the field at all (the same
+            # endpoints `fallback_models` warns about above) -- forwarding it
+            # there would fail the request rather than degrade gracefully.
+            if (
+                FALLBACKS_FIELD in config.extra_body
+                and FALLBACKS_FIELD not in extra_body
+                and not (self.is_bedrock() or self.is_vertex() or self.is_azure())
+            ):
+                extra_body[FALLBACKS_FIELD] = config.extra_body[FALLBACKS_FIELD]
+                if FALLBACK_BETA not in betas:
+                    betas.append(FALLBACK_BETA)
 
         # return config
         return params, extra_body, headers, betas
@@ -3334,15 +3352,22 @@ async def model_output_from_message(
         span_recorder=span_recorder,
     )
 
-    # count reasoning tokens (skip empty thinking text -- omitted summaries
-    # come back as "" and count_tokens rejects empty content with a 400)
-    reasoning_tokens = 0
-    if client and model:
-        for content_block in message.content:
-            if isinstance(content_block, ThinkingBlock) and content_block.thinking:
-                reasoning_tokens += await count_tokens(
-                    client, model, content_block.thinking
-                )
+    # reasoning tokens: prefer the count the API reports. Falling back to
+    # counting the thinking text costs an extra count_tokens round trip per
+    # thinking block, and undercounts -- it prices the summary rather than the
+    # reasoning it stands in for. (Skip empty thinking text: omitted summaries
+    # come back as "" and count_tokens rejects empty content with a 400.)
+    reported_details = message.usage.output_tokens_details
+    if reported_details is not None:
+        reasoning_tokens = reported_details.thinking_tokens
+    else:
+        reasoning_tokens = 0
+        if client and model:
+            for content_block in message.content:
+                if isinstance(content_block, ThinkingBlock) and content_block.thinking:
+                    reasoning_tokens += await count_tokens(
+                        client, model, content_block.thinking
+                    )
 
     # cache-diagnostics: tag the assistant message with the upstream id so a
     # subsequent turn can pass it as `diagnostics.previous_message_id`.
@@ -3886,6 +3911,9 @@ EXTRA_BODY = "extra_body"
 CONTEXT_MANAGEMENT = "context_management"
 MIN_COMPACTION_TOKENS = 50000  # Anthropic API minimum trigger value
 FALLBACK_BETA = "server-side-fallback-2026-06-01"
+# Request-body field carrying a server-side refusal fallback directive. Routed
+# via extra_body because the SDK only exposes it on client.beta.messages.create.
+FALLBACKS_FIELD = "fallbacks"
 
 
 def _add_edit_compaction(

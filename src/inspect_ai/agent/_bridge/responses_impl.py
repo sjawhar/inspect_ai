@@ -180,6 +180,7 @@ from .util import (
     resolve_generate_config,
     resolve_inspect_model,
     validate_bridge_media,
+    validate_client_config,
     withheld_bridge_tool,
 )
 
@@ -212,7 +213,13 @@ async def inspect_responses_api_request_impl(
 ) -> Response:
     # resolve model
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(bridge_model_name, bridge.model_aliases, bridge.model)
+    model = resolve_inspect_model(
+        bridge_model_name,
+        bridge.model_aliases,
+        bridge.model,
+        model_resolver=bridge.model_resolver,
+        provider="openai",
+    )
     model_name = model.api.model_name
     is_openai = _is_openai_responses_provider(model)
 
@@ -295,9 +302,12 @@ async def inspect_responses_api_request_impl(
     debug_log("INSPECT MESSAGES", messages)
 
     # extract generate config (hoist instructions into system_message)
-    config = generate_config_from_openai_responses(json_data)
+    config = generate_config_from_openai_responses(
+        json_data, forward_reasoning=bridge.forward_generation_config
+    )
     if not bridge.forward_generation_config:
         clear_generation_params(config)
+    validate_client_config(config)
     config.extra_headers = headers
     if config.system_message:
         messages.insert(0, ChatMessageSystem(content=config.system_message))
@@ -319,7 +329,7 @@ async def inspect_responses_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # return response
     response = Response(
@@ -646,7 +656,9 @@ def responses_tool_params_to_tools(tool_params: list[ToolParam]) -> list[Respons
     return tool_list_adapter.validate_python(tool_params)
 
 
-def generate_config_from_openai_responses(json_data: dict[str, Any]) -> GenerateConfig:
+def generate_config_from_openai_responses(
+    json_data: dict[str, Any], *, forward_reasoning: bool = False
+) -> GenerateConfig:
     # warn for unsupported params
     def warn_unsupported(param: str) -> None:
         if param in json_data:
@@ -666,7 +678,7 @@ def generate_config_from_openai_responses(json_data: dict[str, Any]) -> Generate
     config.top_logprobs = json_data.get("top_logprobs", None)
     config.parallel_tool_calls = json_data.get("parallel_tool_calls", None)
     reasoning = json_data.get("reasoning", None)
-    if reasoning:
+    if reasoning and not forward_reasoning:
         if "effort" in reasoning:
             config.reasoning_effort = reasoning["effort"]
         if "summary" in reasoning:
@@ -687,11 +699,21 @@ def generate_config_from_openai_responses(json_data: dict[str, Any]) -> Generate
                     strict=format.get("strict", None),
                 )
 
+        # `text.verbosity` has a GenerateConfig slot and the provider already
+        # sends it (`params["text"]["verbosity"]`), but nothing read it off the
+        # request, so a client asking for terse output silently got the model
+        # default.
+        verbosity = text.get("verbosity", None)
+        if verbosity is not None:
+            config.verbosity = verbosity
+
     # extra_body params (i.e. passthrough for native responses)
     extra_body: dict[str, Any] = {}
     for field in responses_extra_body_fields():
         if field in json_data:
             extra_body[field] = json_data[field]
+    if forward_reasoning and reasoning is not None:
+        extra_body["reasoning"] = reasoning
     if len(extra_body) > 0:
         config.extra_body = extra_body
 

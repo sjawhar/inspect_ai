@@ -1,5 +1,10 @@
 """Tests for bridge header extraction and filtering."""
 
+import json
+
+import brotli  # type: ignore[import-untyped]
+import httpx
+
 from inspect_ai.agent._bridge.bridge import (
     _BLOCKED_BRIDGE_HEADER_PREFIXES,
     _BLOCKED_BRIDGE_HEADERS,
@@ -27,6 +32,34 @@ class TestFilterBridgeHeaders:
         }
         result = filter_bridge_headers(headers)
         assert result == headers
+
+    def test_accept_encoding_passes_through(self):
+        """The bridged client's supported response encodings are preserved."""
+        headers = {"Accept-Encoding": "gzip, deflate, br, zstd"}
+        assert filter_bridge_headers(headers) == headers
+
+    def test_httpx_decodes_forwarded_brotli_response(self):
+        """The bridge transport decodes any encoding it advertises.
+
+        Forwarding Accept-Encoding is only faithful to the client if the
+        transport can also read what the provider sends back: once `br` is
+        forwarded, Anthropic actually responds brotli-encoded.
+        """
+        payload = {"model": "claude-fable-5", "type": "message"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert "br" in request.headers["accept-encoding"].split(", ")
+            return httpx.Response(
+                200,
+                content=brotli.compress(json.dumps(payload).encode()),
+                headers={
+                    "content-encoding": "br",
+                    "content-type": "application/json",
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            assert client.get("https://api.anthropic.com/v1/messages").json() == payload
 
     def test_blocked_headers_removed(self):
         """Test that blocked headers are removed."""

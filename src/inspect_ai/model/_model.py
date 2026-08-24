@@ -2035,6 +2035,57 @@ or return ``None`` to allow default processing to continue.
 """
 
 
+ModelResponseFilter: TypeAlias = Callable[
+    [
+        Model,
+        ModelOutput,
+        list[ChatMessage],
+        list[ToolInfo],
+        ToolChoice | None,
+        GenerateConfig,
+    ],
+    Awaitable[ModelOutput | None],
+]
+"""Filter that mutates a model's output after generation.
+
+Called inside the bridge's refusal-retry loop, after ``model.generate()``
+returns and before the compaction baseline is updated. Receives the
+resolved ``Model``, the ``ModelOutput`` returned by ``model.generate()``,
+and the same input arguments that were sent to the model.
+
+Return a ``ModelOutput`` to replace the response, or ``None`` to pass
+through unchanged. Returning an output with ``stop_reason="content_filter"``
+triggers a refusal retry (subject to ``bridge.retry_refusals``); returning
+one with any other ``stop_reason`` completes the turn.
+
+Note: mutations to the returned ``ModelOutput`` propagate into bridge state
+and into the assistant history sent to the model on subsequent turns. If a
+filter mutates ``output.message.tool_calls[*].arguments`` (for example, to
+rewrite tool inputs before execution), callers that want the model to see a
+consistent view across turns should apply a symmetric inverse mutation in
+the request ``filter`` so the assistant history visible to the model on the
+next turn matches what the model originally emitted. Filters that only
+substitute outputs without depending on cross-turn consistency do not need
+this symmetric setup.
+
+Unlike ``GenerateFilter``, this filter has no ``str``-first deprecated
+variant — it is a new addition with no legacy form.
+"""
+
+
+ModelResolver: TypeAlias = Callable[[str], "Model | str | None"]
+"""Dynamic per-request model resolver for the agent bridge.
+
+Receives the requested model name and returns the ``Model`` (or model spec
+string) to use instead, or ``None`` to defer to the bridge's normal resolution
+(aliases / fallback / ``get_model``). On a provider-specific bridge endpoint the
+name is first qualified by that provider, so the resolver receives e.g.
+``openai/gpt-5.1`` rather than a bare ``gpt-5.1``. Lets a bridge express a routing
+*policy* (e.g. route every request to the model under test) without enumerating
+every possible model name as an alias.
+"""
+
+
 class AttemptTimeoutError(RuntimeError):
     def __init__(self, timeout: int | None) -> None:
         super().__init__(f"attempt_timeout '{timeout or 0}' exceeded.")

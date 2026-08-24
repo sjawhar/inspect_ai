@@ -313,6 +313,80 @@ async def test_responses_api_invalid_prompt_content_filter():
     assert output.choices[0].stop_details.type == "refusal"
 
 
+async def test_responses_api_cyber_policy_content_filter():
+    """A `cyber_policy` in-body error must return a content_filter refusal.
+
+    Regression: the in-body Responses error path only recognized
+    `invalid_prompt` and raised OpenAIResponseError for every other code,
+    including gpt-5's `cyber_policy`. Through the agent bridge that raise looks
+    like a transport error, so a bridged CLI (Codex) re-issued the identical
+    request in a tight loop -- one captured transcript had the same blocked
+    request retried ~90 times per turn. It must instead surface as a finished,
+    non-retryable refusal, matching the HTTP 4xx path (openai_handle_bad_request).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from openai._types import NOT_GIVEN
+    from openai.types.responses import Response, ResponseError
+
+    from inspect_ai.model._providers.openai_responses import generate_responses
+    from inspect_ai.model._providers.util.hooks import HttpxHooks
+
+    # `cyber_policy` is not in the SDK's ResponseError code Literal (the proxy
+    # emits it), so build the error without validation -- exactly as it arrives.
+    mock_response = Response.model_construct(
+        id="resp_test",
+        created_at=0.0,
+        model="gpt-5.6",
+        object="response",
+        output=[],
+        tools=[],
+        error=ResponseError.model_construct(
+            code="cyber_policy",
+            message="This content was flagged for possible cybersecurity risk.",
+        ),
+        status="failed",
+    )
+
+    client = MagicMock()
+    client.responses = MagicMock()
+    client.responses.create = AsyncMock(return_value=mock_response)
+
+    http_hooks = MagicMock(spec=HttpxHooks)
+    http_hooks.start_request = MagicMock(return_value="req_1")
+    http_hooks.end_request = MagicMock(return_value=None)
+
+    model_info = MagicMock()
+    model_info.is_o_series.return_value = False
+    model_info.is_gpt.return_value = True
+    model_info.is_gpt_5.return_value = True
+
+    output, model_call = await generate_responses(
+        client=client,
+        http_hooks=http_hooks,
+        model_name="gpt-5.6",
+        input=[],
+        tools=[],
+        tool_choice=None,
+        config=GenerateConfig(),
+        background=None,
+        service_tier=None,
+        prompt_cache_key=NOT_GIVEN,
+        prompt_cache_retention=NOT_GIVEN,
+        safety_identifier=NOT_GIVEN,
+        responses_store=None,
+        synthesize_phase=False,
+        model_info=model_info,
+        batcher=None,
+    )
+    assert isinstance(output, ModelOutput)
+    assert output.stop_reason == "content_filter"
+    assert "cybersecurity risk" in output.completion
+    # cyber refusals carry structured, category-tagged stop details
+    assert output.choices[0].stop_details is not None
+    assert output.choices[0].stop_details.category == "cyber"
+
+
 async def _generate_responses_with_mock(
     mock_response,
     config: GenerateConfig = GenerateConfig(),

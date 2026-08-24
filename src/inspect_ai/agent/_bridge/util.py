@@ -3,8 +3,10 @@ import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from logging import getLogger
-from typing import Iterator, Sequence, cast
+from typing import Any, Iterator, Sequence, cast
 
+from pydantic import ValidationError
+from pydantic_core import PydanticSerializationError
 from typing_extensions import TypeIs
 
 from inspect_ai._util.content import (
@@ -34,6 +36,8 @@ from inspect_ai.model._model import (
     GenerateInput,
     Model,
     ModelGenerateFilter,
+    ModelName,
+    ModelResolver,
     active_model,
     get_model,
     model_roles,
@@ -49,6 +53,7 @@ from inspect_ai.tool._tools._web_search._web_search import (
     WebSearchProviders,
     _normalize_config,
 )
+from inspect_ai.util._json import JSONSchema
 
 # Generation-tuning fields a scaffold may set on a bridged request that describe
 # *how* the underlying model generates. These are the Inspect model's province
@@ -73,6 +78,7 @@ _GENERATION_PARAM_FIELDS: tuple[str, ...] = (
     "reasoning_effort",
     "reasoning_tokens",
     "reasoning_summary",
+    "verbosity",
 )
 
 
@@ -85,6 +91,70 @@ def clear_generation_params(config: GenerateConfig) -> None:
     """
     for field in _GENERATION_PARAM_FIELDS:
         setattr(config, field, None)
+
+
+def validate_client_config(config: GenerateConfig) -> None:
+    """Re-validate a config built from a client request, raising on bad values.
+
+    The `generate_config_from_*` extractors assign request values straight onto
+    `GenerateConfig`, and pydantic does not validate on assignment, so a client
+    can put any value into a typed field. That value is legal in memory, is
+    serialized into the `ModelEvent`, and then fails `model_validate` when the
+    event is READ back -- which is not a per-event failure: it aborts the read of
+    the whole sample transcript (`inspect ctl sample events` returns 500, and any
+    log reader hits the same `ValidationError`). One bad request field therefore
+    costs the entire sample's transcript.
+
+    Reachable without any bridge configuration: `stop_seqs` and `seed` are not
+    generation params, so `stop_sequences: 5` or `seed: "x"` poisons the event
+    even when the bridge is dropping generation params. Forwarding them widens it
+    to `effort`, `temperature` and the rest.
+
+    Raising `BridgePolicyError` makes the bridge answer 400, which is what the
+    real provider APIs answer for these values -- so the client sees the same
+    rejection it would have seen unbridged, rather than a 200 whose transcript
+    cannot be read afterwards.
+    """
+    try:
+        GenerateConfig.model_validate(config.model_dump(mode="json", warnings=False))
+    except PydanticSerializationError as ex:
+        # The dump half can fail too, and its escape is worse than a bad value: the
+        # sandbox path logs a traceback and forwards status `None`, the in-process
+        # path raises into the SDK caller. Unreachable from a real JSON body, but the
+        # in-process Anthropic patch merges `options.extra_json` into `json_data`
+        # before SDK serialization, so a scaffold can put a live Python object here.
+        raise BridgePolicyError(
+            f"generation parameter in bridged request is not serializable ({ex})"
+        ) from ex
+    except ValidationError as ex:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in ex.errors()
+        )
+        raise BridgePolicyError(
+            f"invalid generation parameter in bridged request ({details})"
+        ) from ex
+
+
+def client_json_schema(schema: dict[str, Any], dialect_field: str) -> JSONSchema:
+    """Parse a client-supplied JSON Schema, answering 400 rather than escaping.
+
+    `JSONSchema.model_validate` raises `ValidationError`, and an uncaught one here
+    is worse than the bad value that caused it: `provider_error_payload` reports
+    `status: None`, which the sandbox service treats as a translation failure --
+    traceback in the log, no status for the client. That is the same unreadable
+    outcome `validate_client_config` exists to prevent, so route it to the same 400.
+    """
+    try:
+        return JSONSchema.model_validate(schema)
+    except ValidationError as ex:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in ex.errors()
+        )
+        raise BridgePolicyError(
+            f"invalid response schema in bridged request ({dialect_field}: {details})"
+        ) from ex
 
 
 _bridge_model_generate: ContextVar[bool] = ContextVar(
@@ -320,6 +390,27 @@ async def bridge_generate(
                     config=config,
                 )
 
+        # Apply response filter if configured.
+        # Runs inside the refusal-retry loop so a filter that returns a
+        # content_filter ModelOutput triggers a retry; the input arguments
+        # passed are the same ones sent to model.generate() (post-request-filter
+        # mutation if applicable).
+        if bridge.response_filter is not None:
+            tool_info_for_response = [
+                tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                for tool in tools
+            ]
+            filtered = await bridge.response_filter(
+                model,
+                output,
+                input_messages,
+                tool_info_for_response,
+                tool_choice,
+                config,
+            )
+            if filtered is not None:
+                output = filtered
+
         # Update the compaction baseline with the actual input token
         # count from the generate call (most accurate source of truth)
         if compact is not None:
@@ -359,7 +450,7 @@ def resolve_generate_config(
     config = bridge_config.merge(model.config)
 
     # apply active model config if appropriate
-    is_active_model = model == active_model()
+    is_active_model = model is active_model()
     if is_active_model:
         config = config.merge(active_generate_config())
 
@@ -370,9 +461,29 @@ def resolve_inspect_model(
     model_name: str,
     model_aliases: dict[str, str | Model] | None = None,
     fallback_model: str | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    provider: str = "",
 ) -> Model:
     if model_aliases and model_name in model_aliases:
         return get_model(model_aliases[model_name])
+
+    # A bare model name on a provider-specific bridge endpoint resolves to that provider (the
+    # endpoint implies it); otherwise get_model rejects the unqualified name.
+    if (
+        provider
+        and "/" not in model_name
+        and model_name != "inspect"
+        and model_name not in model_roles()
+    ):
+        model_name = f"{provider}/{model_name}"
+
+    # Dynamic routing policy: checked after explicit aliases, before the static
+    # fallback. Returning None defers to the fallback / normal resolution below.
+    if model_resolver is not None:
+        resolved = model_resolver(model_name)
+        if resolved is not None:
+            return resolved if isinstance(resolved, Model) else get_model(resolved)
 
     if fallback_model is not None:
         if model_name != "inspect" or not fallback_model.startswith("inspect/"):
@@ -384,6 +495,23 @@ def resolve_inspect_model(
     model_name = model_name.removeprefix("inspect/")
     if model_name in model_roles():
         return get_model(role=model_name)
+
+    # Prefer the eval's own Model instance when the client names it.
+    #
+    # A bridged client may send the concrete model id instead of asking for
+    # "inspect" (claude_code sends e.g. "claude-fable-5"). get_model() memoizes on a
+    # key that includes the config JSON, so resolving by name alone handed back a
+    # DIFFERENT instance than the eval's active model -- and resolve_generate_config
+    # only applies the eval's GenerateConfig to the active model, so eval-level
+    # options were silently dropped before the provider request. Returning the active
+    # instance also avoids a second Model (and its connection pool) for one model.
+    #
+    # Deliberately placed last: aliases, an explicit "inspect", model roles, and the
+    # dynamic resolver all return above, so this cannot redirect any of them.
+    active = active_model()
+    if active is not None and model_name in (str(active), ModelName(active).name):
+        return active
+
     return get_model(model_name)
 
 
