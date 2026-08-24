@@ -13,6 +13,7 @@ from anthropic.types import (
     ImageBlockParam,
     Message,
     MessageParam,
+    OutputTokensDetails,
     SearchResultBlockParam,
     TextBlockParam,
     ToolChoiceParam,
@@ -576,4 +577,9 @@ def anthropic_usage(usage: ModelUsage) -> Usage:
         output_tokens=usage.output_tokens,
         cache_creation_input_tokens=usage.input_tokens_cache_write,
         cache_read_input_tokens=usage.input_tokens_cache_read,
+        output_tokens_details=OutputTokensDetails(
+            thinking_tokens=usage.reasoning_tokens
+        )
+        if usage.reasoning_tokens is not None
+        else None,
     )
