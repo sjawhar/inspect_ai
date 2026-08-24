@@ -1,11 +1,55 @@
 ## Unreleased
 
+- Agent bridge: Anthropic responses now report thinking tokens in `usage.output_tokens_details`, so bridged clients can distinguish a reasoning response from a plain one.
+- Fixed a sandbox service (including the sandbox agent bridge) permanently ceasing to answer requests after one slow request, which previously required destroying the sandbox to recover.
+- Agent Bridge: Transparent bridged requests now decode Brotli responses when clients advertise `br` through `Accept-Encoding`.
+- Sandboxes: The HTTP proxy example now disables container network egress, preventing agents from bypassing mitmproxy by ignoring proxy environment variables.
+- Sandboxes: The evals-in-eval example now uses rootless Docker-in-Docker and warns that its privileged sidecar is unsuitable for adversarial agents.
+- Sandbox: Recognized Docker failures to run a command (stopped container; missing or unlaunchable timeout wrapper) now surface as tool errors of type `sandbox_unavailable` rather than as command output; non-tool callers (e.g. scorers) get a `SandboxUnavailableError` or `PermissionError` raise. (#4709)
+- Scoring: Treat numeric string metric return values as scalar values rather than sequences in eval results. (#4903)
+- Multiple Choice: A single-choice answer carrying a stray trailing comma (e.g. `ANSWER: A,`) is now scored instead of rejected as no answer.
+- Model-graded scorers now warn once when an explicit model bypasses a required model role.
+- Dataset: Choices fields read from CSV or JSON no longer produce an empty-string choice from trailing or doubled commas.
+- Control Channel: `inspect ctl sample requeue` can now sweep every currently-errored sample in one command (`--errored`) or requeue several `SAMPLE_ID EPOCH` pairs, reporting each sample's result individually.
+- Breaking: Removed the deprecated hidden flat `inspect ctl` spellings (e.g. `ctl tasks`, `ctl limits`); use the noun-group commands (`ctl task list`, `ctl config`, ...) instead.
+- Control Channel: `inspect ctl config` can now retune a running task's per-sample time/token/message limits mid-flight (`--time-limit` / `--token-limit` / `--message-limit`), reaching in-flight samples as well as ones not yet started.
+- Eval Log: Flushing buffered samples to an `.eval` log now yields between samples, so a large flush no longer stalls in-flight samples and control-channel requests for the whole batch.
 - ACP: Emit an `inspect/turn_state` extension notification (`started` / `ended` / `cancelled`) from the agent turn boundary so ACP clients have an exact "agent working" signal.
 - Inspect CTL: Terminal escape sequences and control characters in agent-generated text are now sanitized in `inspect ctl` human-readable output, preventing spoofing of the operator's terminal.
+- Control Channel: New `--now` flag on `inspect ctl task|model|process pause` additionally holds in-flight samples at their next model call until resume, with held-sample counts reported in `inspect ctl task list`.
+- Control Channel: `inspect ctl config` no longer version-gates individual knobs — current eval processes reject unsupported knobs atomically server-side, and only processes predating strict config validation are refused as a whole.
 - Fixed sandbox tools (`text_editor`, `bash_session`) failing to install in non-root sandboxes (e.g. Kubernetes pods with `runAsNonRoot`).
-- Agent Bridge: Transparent bridged requests now decode Brotli responses when clients advertise `br` through `Accept-Encoding`.
+- Bugfix: Model outputs stopped by a provider content filter are no longer cached, so `retry_refusals` gets a fresh model attempt instead of a replayed cached refusal.
+- Docker Sandbox: Prerequisite checks now validate the daemon version rather than the CLI version and explain when daemon metadata is unavailable.
+- Bugfix: `web_search("exa")` no longer fails with a validation error, and Exa citations now include page text by default.
+- Breaking: Runtime media paths and URLs now require `materialize_media()` before model use; fixed selected-dataset media remains automatic, while sandbox bridges require inline data URIs.
+- Fixed sandbox agent bridge forwarding file inputs that are not inline `data:` URIs (e.g. host paths or URLs); such requests are now rejected.
+- Mistral: Provider-generated images remain available when replayed in subsequent conversation turns.
+- Docs: Clarify that the sandbox `exec()` output limit is enforced by front-truncating the output streams rather than by raising `OutputLimitExceededError` (which remains the behaviour for `read_file()`). (#4778)
+- Anthropic: A client-supplied `fallbacks` directive is now forwarded to the API verbatim instead of being dropped (skipped on bedrock/vertex/azure, which reject the field).
+- Agent Bridge: Side calls to a different model can no longer displace the tracked agent conversation, regardless of thread shape.
+- MCP: A shared `ToolSource` no longer serves one sample's tools to another; cached tools are re-resolved when the async scope changes.
+- Agent Bridge: Image tool results now reach sandboxed agents as MCP image content instead of being flattened to text.
+- Agent Bridge: Bridged Anthropic requests now preserve `system` block boundaries, so instruction blocks are no longer silently discarded by the API.
+- Agent Bridge: Client-supplied HTTP headers are now forwarded through the sandbox agent-bridge model proxy to the bridged model request.
+- Agent Bridge: A bridged client's `reasoning` options now reach the model request verbatim when forwarding generation config, preserving fields like `context` that were previously dropped.
+- Human Agent: `human_cli()` now accepts a `commands_filter` option for tailoring the commands available in the human agent CLI.
+- Agent Bridge: `agent_bridge()` and `sandbox_agent_bridge()` now accept a `response_filter` for transforming model output before it is returned.
+- Agent Bridge: a bare model name arriving on a provider-specific bridge endpoint (`openai`/`google`/`anthropic`) now resolves to that provider (`resolve_inspect_model(..., provider=)`) instead of being rejected as unqualified, so bridge clients can send plain model names like `gpt-5.1`.
+- Agent Bridge: A bridged client that sends the eval model's concrete id instead of `inspect` (claude_code sends e.g. `claude-fable-5`) now resolves to the eval's own `Model` instance rather than a second one built by `get_model()`, whose memoization key includes the config. Previously such a client got a distinct instance, and since the eval's `GenerateConfig` is only applied to the active model, eval-level options such as `fallback_models` were silently dropped before the provider request. Aliases, model roles, and any other model the client names are unaffected.
+- Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
+- Bugfix: A sandbox that becomes unreachable during `exec_remote()` now reports why instead of a bare `RetryError`.
+- Eval: added opt-in `INSPECT_GC_MODE=low_latency` to suppress automatic full collections during high-concurrency runs while retaining a cgroup-memory guard.
+- Google: Reuse one SSL context across model clients instead of rebuilding it per request, removing blocking CA-bundle reads that could stall evals at high sandbox concurrency.
+- Google: bridged agent calls no longer rebuild the SSL context on every model call, which was blocking the event loop under high sandbox concurrency.
+- MCP: a sandboxed MCP server is now started once per sample instead of once per tool call, so an eval with many concurrent samples no longer spends most of its time on server startup and handshakes.
+- Task: added `sample_resources`, async context managers held open for a whole sample (entered once its sandbox exists, exited after scoring) — use it to pay for a per-sample connection or process once rather than per solver.
+- Agent bridge: A bridged request asking for Anthropic `output_config.format`, OpenAI `text.verbosity`, or any of Gemini's `thinkingConfig.thinkingBudget`, `presencePenalty`, `frequencyPenalty`, `responseLogprobs` and `logprobs` now gets it, instead of silently receiving the model default.
+- Agent bridge: A bridged Gemini response now reports `thoughtsTokenCount`, so a client can see how many thinking tokens a request used.
+- Agent bridge: An invalid generation parameter in a bridged request (e.g. `stop_sequences: 5`) is now rejected with a 400 instead of being recorded into an event that cannot be read back, which made the whole sample transcript unreadable.
 
 ## 0.3.259 (16 August 2026)
+
 
 - Inspect View: The Messages tab now paginates chunked evals, loading further pages as you scroll instead of the entire sample up front, so huge samples open quickly (non-chunked evals still load in full). (#498)
 - Inspect View: Image-heavy info events now show their "more…" toggle — previously the clipped content was unexpandable. (#529)
@@ -30,6 +74,7 @@
 - Datasets (breaking): A ragged CSV row now raises `ValueError` naming the file and line, instead of `AttributeError` or a silent load. (#4546)
 - Multiple Choice: Answers listing choices with an Oxford or trailing comma (e.g. `ANSWER: A, B, and C`) are now scored correctly instead of as no answer.
 - Bugfix: MCP sandbox sessions are now cached per tool-source instance and cleared on close, so one instance's sessions and tool lists no longer leak into another's.
+- Bugfix: Recovered eval logs now report reasoning tokens and total cost in their top-level usage summary, which previously showed both as null.
 
 ## 0.3.258 (11 August 2026)
 
@@ -61,7 +106,6 @@
 
 - Security: Parse `math()` scorer answers with a non-evaluating grammar under a bounded worker thread, preventing model output from executing Python on the evaluator host.
 - Hooks: `on_task_start` now receives the resolved solver plan as `data.plan`, including any `Task.setup` solvers.
-- Bugfix: Recovered eval logs now report reasoning tokens and total cost in their top-level usage summary, which previously showed both as null.
 
 ## 0.3.255 (09 August 2026)
 

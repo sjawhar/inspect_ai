@@ -5,6 +5,7 @@ import os
 import sys
 from contextlib import nullcontext
 from contextvars import Token, copy_context
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -55,7 +56,12 @@ from inspect_ai._util.constants import (
     JSON_LOG_FORMAT,
 )
 from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.event_loop_monitor import (
+    event_loop_monitor,
+    loop_attribution_enabled,
+)
 from inspect_ai._util.file import absolute_file_path, filesystem
+from inspect_ai._util.gc_tuning import configure_gc
 from inspect_ai._util.log_context import set_run_shape
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.platform import platform_init
@@ -107,6 +113,7 @@ from .task.enqueue import (
     create_task_enqueuer,
     register_task_enqueuer,
 )
+from .task.images import InputMediaPolicy
 from .task.resolved import ResolvedTask, resolved_model_names
 from .task.tasks import Tasks
 
@@ -797,6 +804,7 @@ async def _eval_async_inner(
             checkpoint,
             notification,
             task_source=task_source,
+            input_media_policy="trusted_pre_run",
         )
 
         # warn and return empty string if we resolved no tasks
@@ -1002,6 +1010,7 @@ async def _eval_async_inner(
         )
         enqueuer: TaskEnqueuer = create_task_enqueuer(run_id, resolve_added_tasks)
         enqueuer_token = register_task_enqueuer(enqueuer)
+        configure_gc()
 
         async with (
             control_server(run_id=run_id, enabled=ctl.enabled) as _ctl_server,
@@ -1037,29 +1046,34 @@ async def _eval_async_inner(
                     debug: bool,
                     inject: TaskInjection | None = None,
                 ) -> list[EvalLog]:
-                    return await eval_run(
-                        eval_set_id=eval_set_id,
-                        run_id=run_id,
-                        tasks=tasks,
-                        parallel=parallel,
-                        eval_config=eval_config,
-                        eval_checkpoint=checkpoint,
-                        recorder=recorder,
-                        header_only=log_header_only,
-                        epochs_reducer=epochs_reducer,
-                        solver=solver,
-                        scanner=scanner,
-                        scan_id=scan_id,
-                        tags=tags,
-                        metadata=metadata,
-                        run_samples=run_samples,
-                        score=score,
-                        debug_errors=debug,
-                        task_retry_attempts=task_retry_attempts,
-                        task_source=task_source,
-                        inject=inject,
-                        **kwargs,
-                    )
+                    async with (
+                        event_loop_monitor(interval=0.05, threshold=0.5)
+                        if loop_attribution_enabled()
+                        else contextlib.nullcontext()
+                    ):
+                        return await eval_run(
+                            eval_set_id=eval_set_id,
+                            run_id=run_id,
+                            tasks=tasks,
+                            parallel=parallel,
+                            eval_config=eval_config,
+                            eval_checkpoint=checkpoint,
+                            recorder=recorder,
+                            header_only=log_header_only,
+                            epochs_reducer=epochs_reducer,
+                            solver=solver,
+                            scanner=scanner,
+                            scan_id=scan_id,
+                            tags=tags,
+                            metadata=metadata,
+                            run_samples=run_samples,
+                            score=score,
+                            debug_errors=debug,
+                            task_retry_attempts=task_retry_attempts,
+                            task_source=task_source,
+                            inject=inject,
+                            **kwargs,
+                        )
 
                 # Run successive batches under this run_id until the run is
                 # exhausted: the seed first, then tasks added imperatively
@@ -1210,7 +1224,14 @@ def _resolve_enqueued_tasks(
             init_active_model(m, config)
             resolved.extend(
                 resolve_tasks(
-                    tasks, {}, m, resolved_roles, sandbox, sample_shuffle, checkpoint
+                    tasks,
+                    {},
+                    m,
+                    resolved_roles,
+                    sandbox,
+                    sample_shuffle,
+                    checkpoint,
+                    input_media_policy="inline_only",
                 )
             )
         return resolved
@@ -1223,7 +1244,10 @@ def _resolve_enqueued_tasks(
     # generate-config ContextVars, so running it in the caller's context would
     # swap that sample's active model out from under it; the copy keeps those
     # mutations local to resolution.
-    resolved = copy_context().run(resolve)
+    resolved = [
+        replace(resolved_task, input_media_policy="inline_only")
+        for resolved_task in copy_context().run(resolve)
+    ]
     if not resolved:
         raise ValueError("No tasks to enqueue (resolution produced none).")
     resolve_model_costs(resolved, cost_limit)
@@ -1870,6 +1894,7 @@ def eval_resolve_tasks(
     eval_checkpoint: CheckpointConfig | None = None,
     notification: bool | str | None = None,
     task_source: TaskSource | None = None,
+    input_media_policy: InputMediaPolicy = "inline_only",
 ) -> tuple[list[ResolvedTask], list[ApprovalPolicy] | None]:
     # resolve model roles and initialize them in the eval context -- this
     # will enable tasks that reference model roles in their initialization
@@ -1909,6 +1934,7 @@ def eval_resolve_tasks(
                     # TaskSource already consumed task_args to build its seed
                     # (resolve_task_source), so don't warn for that path.
                     warn_unconsumed_task_args=(i == 0 and task_source is None),
+                    input_media_policy=input_media_policy,
                 )
             )
 

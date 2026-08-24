@@ -4,6 +4,7 @@ import functools
 import hashlib
 import json
 import os
+import ssl
 from copy import copy
 from io import BytesIO
 from logging import getLogger
@@ -74,7 +75,7 @@ from inspect_ai._util.http import (
     is_retryable_http_status,
     parse_retry_after_from_exception,
 )
-from inspect_ai._util.images import file_as_data
+from inspect_ai._util.images import inline_media_data
 from inspect_ai._util.kvstore import inspect_kvstore
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.trace import trace_message
@@ -903,6 +904,29 @@ class GoogleGenAIAPI(ModelAPI):
         if self._oauth and self._credentials is not None:
             await self._credentials.ensure_valid()
 
+    @staticmethod
+    @functools.cache
+    def _ssl_context() -> ssl.SSLContext:
+        """The shared SSL context for genai clients, built once per process.
+
+        `Client()` is constructed per `generate()` call (deliberately — a shared client
+        would share a principal), and each construction calls both
+        `_ensure_httpx_ssl_ctx` and `_ensure_websocket_ssl_ctx`, which build a default
+        context from `certifi.where()`. That reads and parses the CA bundle from disk
+        SYNCHRONOUSLY on the event loop, once per model call. At high sandbox
+        concurrency it showed up in py-spy dumps of a saturated runner loop, where
+        blocking work starves the sandbox-service RPC consumer.
+
+        A context carries only CA trust, not credentials, so unlike the client itself it
+        is safe to share across principals.
+        """
+        import certifi
+
+        return ssl.create_default_context(
+            cafile=os.environ.get("SSL_CERT_FILE", certifi.where()),
+            capath=os.environ.get("SSL_CERT_DIR"),
+        )
+
     def model_client(self, http_options: HttpOptions | None = None) -> Client:
         from inspect_ai._util._async import current_async_backend
 
@@ -910,6 +934,28 @@ class GoogleGenAIAPI(ModelAPI):
             base_url=self.base_url,
             api_version=self.api_version,
         )
+        # Pre-seed the SSL context genai would otherwise rebuild per client. It reads
+        # `verify` for httpx and `ssl` for the websocket transport, and skips creating
+        # one when either is already present.
+        #
+        # Seed BOTH dicts. genai resolves the context with
+        #     args.get(verify) if args else None or async_args.get(verify) if async_args
+        # which parses as
+        #     args.get(v) if args else ((None or async_args.get(v)) if async_args else None)
+        # so a non-empty `client_args` makes it read the SYNC dict and never consult the
+        # async one. The bridge passes `client_args`, so seeding only the async dict
+        # missed there and genai rebuilt the context on the event loop -- observed with
+        # py-spy as create_default_context under bridge_generate on a live run.
+        context = self._ssl_context()
+        async_client_args = dict(http_options.async_client_args or {})
+        if "verify" not in async_client_args or "ssl" not in async_client_args:
+            async_client_args.setdefault("verify", context)
+            async_client_args.setdefault("ssl", context)
+            http_options.async_client_args = async_client_args
+        client_args = dict(http_options.client_args or {})
+        if "verify" not in client_args:
+            client_args["verify"] = context
+            http_options.client_args = client_args
         # aiohttp requires asyncio; use httpx under trio for compatibility
         if (
             current_async_backend() == "trio"
@@ -1583,7 +1629,7 @@ async def chat_content_to_part(
     content: ContentImage | ContentAudio | ContentVideo | ContentDocument,
 ) -> Part:
     if isinstance(content, ContentImage):
-        content_bytes, mime_type = await file_as_data(content.image)
+        content_bytes, mime_type = inline_media_data(content.image, "image")
         return Part.from_bytes(mime_type=mime_type, data=content_bytes)
     else:
         file = await file_for_content(client, content)
@@ -2390,7 +2436,25 @@ async def file_for_content(
         file = content.video
     else:
         file = content.document
-    content_bytes, mime_type = await file_as_data(file)
+    content_bytes, mime_type = inline_media_data(
+        file,
+        "audio"
+        if isinstance(content, ContentAudio)
+        else "video"
+        if isinstance(content, ContentVideo)
+        else "document",
+        mime_type_hint=(
+            ("audio/mpeg" if content.format == "mp3" else "audio/wav")
+            if isinstance(content, ContentAudio)
+            else {
+                "mp4": "video/mp4",
+                "mpeg": "video/mpeg",
+                "mov": "video/quicktime",
+            }[content.format]
+            if isinstance(content, ContentVideo)
+            else content.mime_type
+        ),
+    )
     content_sha256 = hashlib.sha256(content_bytes).hexdigest()
     # we cache uploads for re-use, open the db where we track that
     # (track up to 1 million previous uploads)

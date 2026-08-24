@@ -1,10 +1,12 @@
 from logging import getLogger  # noqa: E402
-from typing import Any, Awaitable, Callable, cast
+from typing import Awaitable, Callable, Protocol, Sequence, cast
 
 import anyio
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
+from inspect_ai._util.content import Content, ContentImage, ContentText
 from inspect_ai._util.json import to_json_str_safe
+from inspect_ai._util.url import data_uri_mime_type, data_uri_to_base64, is_data_uri
 from inspect_ai.model._call_tools import get_tools_info
 from inspect_ai.tool._tools._code_execution import CodeExecutionProviders
 from inspect_ai.tool._tools._web_search._web_search import WebSearchProviders
@@ -13,6 +15,7 @@ from inspect_ai.util._sandbox import SandboxEnvironment, sandbox_service
 
 from .._errors import PROVIDER_ERROR_KEY, provider_error_payload
 from ..anthropic_api import inspect_anthropic_api_request
+from ..bridge import filter_bridge_headers
 from ..completions import inspect_completions_api_request
 from ..google_api import inspect_google_api_request
 from ..responses import inspect_responses_api_request
@@ -21,8 +24,15 @@ from .types import SandboxAgentBridge
 logger = getLogger(__name__)
 
 MODEL_SERVICE = "bridge_model_service"
+JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
-GenerateMethod = Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]
+
+class GenerateMethod(Protocol):
+    async def __call__(
+        self,
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]: ...
 
 
 def _forward_provider_errors(generate: GenerateMethod) -> GenerateMethod:
@@ -39,9 +49,10 @@ def _forward_provider_errors(generate: GenerateMethod) -> GenerateMethod:
 
     async def generate_forwarding_errors(
         json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
     ) -> dict[str, JsonValue]:
         try:
-            return await generate(json_data)
+            return await generate(json_data, headers)
         except LimitExceededError:
             raise
         except Exception as ex:
@@ -100,9 +111,13 @@ async def run_model_service(
 
 def generate_completions(
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        completion = await inspect_completions_api_request(json_data, None, bridge)
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue], headers: dict[str, str] | None = None
+    ) -> dict[str, JsonValue]:
+        completion = await inspect_completions_api_request(
+            json_data, filter_bridge_headers(headers), bridge
+        )
         return completion.model_dump(mode="json", warnings=False)
 
     return generate
@@ -112,10 +127,16 @@ def generate_responses(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue], headers: dict[str, str] | None = None
+    ) -> dict[str, JsonValue]:
         completion = await inspect_responses_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -126,10 +147,16 @@ def generate_anthropic(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue], headers: dict[str, str] | None = None
+    ) -> dict[str, JsonValue]:
         completion = await inspect_anthropic_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -140,8 +167,11 @@ def generate_google(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue], headers: dict[str, str] | None = None
+    ) -> dict[str, JsonValue]:
+        del headers
         completion = await inspect_google_api_request(
             json_data, web_search, code_execution, bridge
         )
@@ -174,12 +204,39 @@ def list_tools(
     return execute
 
 
+def _mcp_tool_content_block(content: JsonValue) -> JsonValue:
+    match content:
+        case {"type": "image", "image": str() as image} if is_data_uri(image):
+            return {
+                "type": "image",
+                "data": data_uri_to_base64(image),
+                "mimeType": data_uri_mime_type(image) or "image/png",
+            }
+        case {"type": "image", "image": str() as image}:
+            return {"type": "text", "text": image}
+        case _:
+            return content
+
+
+def _mcp_tool_result_content(
+    result: ContentImage | Sequence[Content],
+) -> list[JsonValue]:
+    content = JSON_VALUE_ADAPTER.validate_json(to_json_str_safe(result))
+    match content:
+        case list():
+            return [_mcp_tool_content_block(block) for block in content]
+        case _:
+            return [_mcp_tool_content_block(content)]
+
+
 def call_tool(
     bridge: SandboxAgentBridge,
-) -> Callable[[str, str, dict[str, Any]], Awaitable[str]]:
+) -> Callable[[str, str, dict[str, JsonValue]], Awaitable[JsonValue]]:
     """Execute a bridged tool and return result."""
 
-    async def execute(server: str, tool: str, arguments: dict[str, Any]) -> str:
+    async def execute(
+        server: str, tool: str, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         if server not in bridge.bridged_tools:
             raise ValueError(f"Unknown bridged tools server: {server}")
 
@@ -196,6 +253,14 @@ def call_tool(
         # serialized correctly — json.dumps can't handle BaseModel.
         if isinstance(result, str):
             return result
+        if isinstance(result, ContentImage) or (
+            isinstance(result, list)
+            and all(
+                isinstance(content, (ContentText, ContentImage)) for content in result
+            )
+            and any(isinstance(content, ContentImage) for content in result)
+        ):
+            return _mcp_tool_result_content(result)
         return to_json_str_safe(result)
 
     return execute

@@ -47,6 +47,7 @@ from inspect_ai.tool._tools._web_search._web_search import (
 )
 from inspect_ai.util._json import JSONSchema
 
+from ._errors import BridgePolicyError
 from .types import AgentBridge
 from .util import (
     apply_message_ids,
@@ -56,6 +57,7 @@ from .util import (
     resolve_generate_config,
     resolve_inspect_model,
     validate_bridge_media,
+    validate_client_config,
     withheld_bridge_tool,
 )
 
@@ -70,7 +72,13 @@ async def inspect_google_api_request_impl(
 ) -> dict[str, Any]:
     # resolve model
     bridge_model_name = str(json_data.get("model", "inspect"))
-    model = resolve_inspect_model(bridge_model_name, bridge.model_aliases, bridge.model)
+    model = resolve_inspect_model(
+        bridge_model_name,
+        bridge.model_aliases,
+        bridge.model,
+        model_resolver=bridge.model_resolver,
+        provider="google",
+    )
 
     # extract request components
     contents: list[dict[str, Any]] = json_data.get("contents", [])
@@ -109,13 +117,14 @@ async def inspect_google_api_request_impl(
 
     # translate messages
     messages = messages_from_google_contents(contents, system_instruction)
-    validate_bridge_media(bridge, messages)
+    await validate_bridge_media(bridge, messages)
     debug_log("INSPECT MESSAGES", messages)
 
     # extract generate config
     config = generate_config_from_google(generation_config)
     if not bridge.forward_generation_config:
         clear_generation_params(config)
+    validate_client_config(config)
 
     # try to maintain id stability
     apply_message_ids(bridge, messages)
@@ -133,7 +142,7 @@ async def inspect_google_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # translate response to Gemini format
     response = gemini_response_from_output(output, model.api.model_name)
@@ -160,6 +169,24 @@ def generate_config_from_google(generation_config: dict[str, Any]) -> GenerateCo
         "stopSequences", generation_config.get("stop_sequences")
     )
 
+    # The provider sends all of these, but nothing read them off the request,
+    # so a client setting any of them silently got the model default.
+    #
+    # `candidateCount` is deliberately NOT forwarded: `google_response_from_output`
+    # emits exactly one candidate, so forwarding it would make Gemini generate
+    # (and bill for) N candidates while the client still sees one. Forwarding it
+    # needs the response builder to surface `output.choices` first.
+    config.presence_penalty = generation_config.get(
+        "presencePenalty", generation_config.get("presence_penalty")
+    )
+    config.frequency_penalty = generation_config.get(
+        "frequencyPenalty", generation_config.get("frequency_penalty")
+    )
+    config.logprobs = generation_config.get(
+        "responseLogprobs", generation_config.get("response_logprobs")
+    )
+    config.top_logprobs = generation_config.get("logprobs")
+
     # structured output: responseJsonSchema is standard JSON Schema; responseSchema
     # is Gemini's OpenAPI-style Schema (uppercase types) which we normalize.
     schema = generation_config.get("responseJsonSchema") or generation_config.get(
@@ -172,6 +199,22 @@ def generate_config_from_google(generation_config: dict[str, Any]) -> GenerateCo
                 _google_schema_to_json_schema(schema)
             ),
         )
+
+    # thinkingConfig carries Gemini's reasoning budget. The provider already
+    # rebuilds a `ThinkingConfig` from `config.reasoning_tokens` (and sets
+    # include_thoughts), so the budget only needs mapping onto it -- without this
+    # the field has no extraction site at all and a client asking for a thinking
+    # budget silently gets the model default. Same defect the Anthropic path had
+    # for `output_config.effort`.
+    thinking_config = generation_config.get(
+        "thinkingConfig", generation_config.get("thinking_config")
+    )
+    if isinstance(thinking_config, dict):
+        budget = thinking_config.get(
+            "thinkingBudget", thinking_config.get("thinking_budget")
+        )
+        if budget is not None:
+            config.reasoning_tokens = budget
 
     # NOTE: We deliberately do NOT set config.system_message from system_instruction here.
     # The system_instruction is already converted to ChatMessageSystem messages in
@@ -435,6 +478,12 @@ def _extract_user_parts(
                     ContentImage(image=f"data:{mime_type};base64,{data}")
                 )
 
+        elif "fileData" in part or "file_data" in part:
+            raise BridgePolicyError(
+                "The Google agent bridge does not support fileData media; "
+                "send the bytes as inlineData instead."
+            )
+
         elif _is_function_response_part(part):
             func_response = part.get(
                 "functionResponse", part.get("function_response", {})
@@ -505,6 +554,12 @@ def _extract_model_parts(
             if text == "(no content)":
                 continue
             content_parts.append(ContentText(text=text))
+
+        elif "fileData" in part or "file_data" in part:
+            raise BridgePolicyError(
+                "The Google agent bridge does not support fileData media; "
+                "send the bytes as inlineData instead."
+            )
 
         elif "functionCall" in part or "function_call" in part:
             func_call = part.get("functionCall", part.get("function_call", {}))
@@ -650,11 +705,19 @@ def gemini_usage_metadata(usage: ModelUsage | None) -> dict[str, int]:
             "candidatesTokenCount": 0,
             "totalTokenCount": 0,
         }
-    return {
+    metadata = {
         "promptTokenCount": usage.input_tokens,
         "candidatesTokenCount": usage.output_tokens,
         "totalTokenCount": usage.total_tokens,
     }
+    # The provider already parses Gemini's `thoughts_token_count` into
+    # `reasoning_tokens`; without emitting it here a bridged client cannot see
+    # thinking tokens at all, which is the metric reasoning-extraction work
+    # measures. Omitted rather than zeroed when absent, so "no thinking" and
+    # "not reported" stay distinguishable.
+    if usage.reasoning_tokens is not None:
+        metadata["thoughtsTokenCount"] = usage.reasoning_tokens
+    return metadata
 
 
 def _convert_google_enums(obj: Any) -> Any:

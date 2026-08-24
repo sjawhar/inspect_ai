@@ -64,7 +64,6 @@ from anthropic.types import (
     ToolTextEditor20250124Param,
     ToolUseBlock,
     ToolUseBlockParam,
-    URLPDFSourceParam,
     WebSearchResultBlock,
     WebSearchTool20250305Param,
     WebSearchTool20260209Param,
@@ -137,11 +136,11 @@ from inspect_ai._util.http import (
     is_retryable_http_status,
     parse_retry_after_from_exception,
 )
-from inspect_ai._util.images import file_as_data, file_as_data_uri
+from inspect_ai._util.images import inline_media_data, inline_media_data_uri
 from inspect_ai._util.json import to_json_str_safe
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.trace import trace_message
-from inspect_ai._util.url import data_uri_mime_type, data_uri_to_base64, is_http_url
+from inspect_ai._util.url import data_uri_mime_type, data_uri_to_base64
 from inspect_ai.log._samples import set_active_model_event_call
 from inspect_ai.model._compaction.edit import (
     TOOL_RESULT_REMOVED,
@@ -1045,6 +1044,24 @@ class AnthropicAPI(ModelAPI):
             # pass through context_management for compaction
             if CONTEXT_MANAGEMENT in config.extra_body:
                 extra_body[CONTEXT_MANAGEMENT] = config.extra_body[CONTEXT_MANAGEMENT]
+            # Pass through a caller-supplied `fallbacks` directive verbatim (the
+            # agent bridge forwards Claude Code's own server-side fallback
+            # request this way). `config.fallback_models` above already wrote
+            # this key, so an explicit Inspect-level setting wins; otherwise the
+            # client's directive is honoured untouched. The beta is appended here
+            # rather than relying on the caller's `anthropic-beta` header, so the
+            # directive cannot be silently ignored by the API. Skipped on
+            # bedrock/vertex/azure, which do not accept the field at all (the same
+            # endpoints `fallback_models` warns about above) -- forwarding it
+            # there would fail the request rather than degrade gracefully.
+            if (
+                FALLBACKS_FIELD in config.extra_body
+                and FALLBACKS_FIELD not in extra_body
+                and not (self.is_bedrock() or self.is_vertex() or self.is_azure())
+            ):
+                extra_body[FALLBACKS_FIELD] = config.extra_body[FALLBACKS_FIELD]
+                if FALLBACK_BETA not in betas:
+                    betas.append(FALLBACK_BETA)
 
         # return config
         return params, extra_body, headers, betas
@@ -3257,15 +3274,22 @@ async def model_output_from_message(
         span_recorder=span_recorder,
     )
 
-    # count reasoning tokens (skip empty thinking text -- omitted summaries
-    # come back as "" and count_tokens rejects empty content with a 400)
-    reasoning_tokens = 0
-    if client and model:
-        for content_block in message.content:
-            if isinstance(content_block, ThinkingBlock) and content_block.thinking:
-                reasoning_tokens += await count_tokens(
-                    client, model, content_block.thinking
-                )
+    # reasoning tokens: prefer the count the API reports. Falling back to
+    # counting the thinking text costs an extra count_tokens round trip per
+    # thinking block, and undercounts -- it prices the summary rather than the
+    # reasoning it stands in for. (Skip empty thinking text: omitted summaries
+    # come back as "" and count_tokens rejects empty content with a 400.)
+    reported_details = message.usage.output_tokens_details
+    if reported_details is not None:
+        reasoning_tokens = reported_details.thinking_tokens
+    else:
+        reasoning_tokens = 0
+        if client and model:
+            for content_block in message.content:
+                if isinstance(content_block, ThinkingBlock) and content_block.thinking:
+                    reasoning_tokens += await count_tokens(
+                        client, model, content_block.thinking
+                    )
 
     # cache-diagnostics: tag the assistant message with the upstream id so a
     # subsequent turn can pass it as `diagnostics.previous_message_id`.
@@ -3809,6 +3833,9 @@ EXTRA_BODY = "extra_body"
 CONTEXT_MANAGEMENT = "context_management"
 MIN_COMPACTION_TOKENS = 50000  # Anthropic API minimum trigger value
 FALLBACK_BETA = "server-side-fallback-2026-06-01"
+# Request-body field carrying a server-side refusal fallback directive. Routed
+# via extra_body because the SDK only exposes it on client.beta.messages.create.
+FALLBACKS_FIELD = "fallbacks"
 
 
 def _add_edit_compaction(
@@ -4348,20 +4375,26 @@ async def message_block_params(
             )
     elif isinstance(content, ContentDocument):
         if content.mime_type == "application/pdf":
-            if is_http_url(content.document):
-                source: Source = URLPDFSourceParam(type="url", url=content.document)
-            else:
-                pdf_data_uri = await file_as_data_uri(content.document)
-                pdf_data = data_uri_to_base64(pdf_data_uri)
-                source = Base64PDFSourceParam(
-                    type="base64", data=pdf_data, media_type="application/pdf"
-                )
+            pdf_data_uri = inline_media_data_uri(
+                content.document, "document", mime_type_hint=content.mime_type
+            )
+            pdf_data = data_uri_to_base64(pdf_data_uri)
+            source: Source = Base64PDFSourceParam(
+                type="base64", data=pdf_data, media_type="application/pdf"
+            )
         elif is_image_type(content.mime_type):
             source = ContentBlockSourceParam(
-                type="content", content=[await image_block_param(content.document)]
+                type="content",
+                content=[
+                    await image_block_param(
+                        content.document, mime_type_hint=content.mime_type
+                    )
+                ],
             )
         else:
-            file_bytes, _ = await file_as_data(content.document)
+            file_bytes, _ = inline_media_data(
+                content.document, "document", mime_type_hint=content.mime_type
+            )
             source = PlainTextSourceParam(
                 type="text", media_type="text/plain", data=file_bytes.decode()
             )
@@ -4608,9 +4641,10 @@ def _content_list(input: str | list[Content]) -> list[Content]:
         return input
 
 
-async def image_block_param(image: str) -> ImageBlockParam:
-    # resolve to url
-    image = await file_as_data_uri(image)
+async def image_block_param(
+    image: str, mime_type_hint: str | None = None
+) -> ImageBlockParam:
+    image = inline_media_data_uri(image, "image", mime_type_hint=mime_type_hint)
 
     # resolve mime type and base64 content
     media_type = data_uri_mime_type(image) or "image/png"

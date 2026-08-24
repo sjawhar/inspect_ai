@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from logging import getLogger
 from typing import Iterator, Sequence, cast
 
+from pydantic import ValidationError
 from typing_extensions import TypeIs
 
 from inspect_ai._util.content import (
@@ -12,11 +13,13 @@ from inspect_ai._util.content import (
     ContentAudio,
     ContentDocument,
     ContentImage,
+    ContentText,
     ContentVideo,
 )
+from inspect_ai._util.images import materialize_media
 from inspect_ai._util.json import to_json_str_safe
 from inspect_ai._util.logger import warn_once
-from inspect_ai._util.url import is_data_uri
+from inspect_ai._util.url import data_uri_mime_type, is_data_uri
 from inspect_ai.agent._bridge._approval import (
     MAX_CONSECUTIVE_REJECTIONS,
     apply_bridge_tool_approval,
@@ -24,6 +27,7 @@ from inspect_ai.agent._bridge._approval import (
 )
 from inspect_ai.agent._bridge._errors import BridgePolicyError
 from inspect_ai.agent._bridge.types import AgentBridge, message_json_hash
+from inspect_ai.model._agent_message import validate_agent_message
 from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
 from inspect_ai.model._generate_config import GenerateConfig, active_generate_config
 from inspect_ai.model._model import (
@@ -31,6 +35,8 @@ from inspect_ai.model._model import (
     GenerateInput,
     Model,
     ModelGenerateFilter,
+    ModelName,
+    ModelResolver,
     active_model,
     get_model,
     model_roles,
@@ -82,6 +88,40 @@ def clear_generation_params(config: GenerateConfig) -> None:
     """
     for field in _GENERATION_PARAM_FIELDS:
         setattr(config, field, None)
+
+
+def validate_client_config(config: GenerateConfig) -> None:
+    """Re-validate a config built from a client request, raising on bad values.
+
+    The `generate_config_from_*` extractors assign request values straight onto
+    `GenerateConfig`, and pydantic does not validate on assignment, so a client
+    can put any value into a typed field. That value is legal in memory, is
+    serialized into the `ModelEvent`, and then fails `model_validate` when the
+    event is READ back -- which is not a per-event failure: it aborts the read of
+    the whole sample transcript (`inspect ctl sample events` returns 500, and any
+    log reader hits the same `ValidationError`). One bad request field therefore
+    costs the entire sample's transcript.
+
+    Reachable without any bridge configuration: `stop_seqs` and `seed` are not
+    generation params, so `stop_sequences: 5` or `seed: "x"` poisons the event
+    even when the bridge is dropping generation params. Forwarding them widens it
+    to `effort`, `temperature` and the rest.
+
+    Raising `BridgePolicyError` makes the bridge answer 400, which is what the
+    real provider APIs answer for these values -- so the client sees the same
+    rejection it would have seen unbridged, rather than a 200 whose transcript
+    cannot be read afterwards.
+    """
+    try:
+        GenerateConfig.model_validate(config.model_dump(mode="json", warnings=False))
+    except ValidationError as ex:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in ex.errors()
+        )
+        raise BridgePolicyError(
+            f"invalid generation parameter in bridged request ({details})"
+        ) from ex
 
 
 _bridge_model_generate: ContextVar[bool] = ContextVar(
@@ -317,6 +357,27 @@ async def bridge_generate(
                     config=config,
                 )
 
+        # Apply response filter if configured.
+        # Runs inside the refusal-retry loop so a filter that returns a
+        # content_filter ModelOutput triggers a retry; the input arguments
+        # passed are the same ones sent to model.generate() (post-request-filter
+        # mutation if applicable).
+        if bridge.response_filter is not None:
+            tool_info_for_response = [
+                tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                for tool in tools
+            ]
+            filtered = await bridge.response_filter(
+                model,
+                output,
+                input_messages,
+                tool_info_for_response,
+                tool_choice,
+                config,
+            )
+            if filtered is not None:
+                output = filtered
+
         # Update the compaction baseline with the actual input token
         # count from the generate call (most accurate source of truth)
         if compact is not None:
@@ -356,7 +417,7 @@ def resolve_generate_config(
     config = bridge_config.merge(model.config)
 
     # apply active model config if appropriate
-    is_active_model = model == active_model()
+    is_active_model = model is active_model()
     if is_active_model:
         config = config.merge(active_generate_config())
 
@@ -367,9 +428,29 @@ def resolve_inspect_model(
     model_name: str,
     model_aliases: dict[str, str | Model] | None = None,
     fallback_model: str | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    provider: str = "",
 ) -> Model:
     if model_aliases and model_name in model_aliases:
         return get_model(model_aliases[model_name])
+
+    # A bare model name on a provider-specific bridge endpoint resolves to that provider (the
+    # endpoint implies it); otherwise get_model rejects the unqualified name.
+    if (
+        provider
+        and "/" not in model_name
+        and model_name != "inspect"
+        and model_name not in model_roles()
+    ):
+        model_name = f"{provider}/{model_name}"
+
+    # Dynamic routing policy: checked after explicit aliases, before the static
+    # fallback. Returning None defers to the fallback / normal resolution below.
+    if model_resolver is not None:
+        resolved = model_resolver(model_name)
+        if resolved is not None:
+            return resolved if isinstance(resolved, Model) else get_model(resolved)
 
     if fallback_model is not None:
         if model_name != "inspect" or not fallback_model.startswith("inspect/"):
@@ -381,6 +462,23 @@ def resolve_inspect_model(
     model_name = model_name.removeprefix("inspect/")
     if model_name in model_roles():
         return get_model(role=model_name)
+
+    # Prefer the eval's own Model instance when the client names it.
+    #
+    # A bridged client may send the concrete model id instead of asking for
+    # "inspect" (claude_code sends e.g. "claude-fable-5"). get_model() memoizes on a
+    # key that includes the config JSON, so resolving by name alone handed back a
+    # DIFFERENT instance than the eval's active model -- and resolve_generate_config
+    # only applies the eval's GenerateConfig to the active model, so eval-level
+    # options were silently dropped before the provider request. Returning the active
+    # instance also avoids a second Model (and its connection pool) for one model.
+    #
+    # Deliberately placed last: aliases, an explicit "inspect", model roles, and the
+    # dynamic resolver all return above, so this cannot redirect any of them.
+    active = active_model()
+    if active is not None and model_name in (str(active), ModelName(active).name):
+        return active
+
     return get_model(model_name)
 
 
@@ -493,31 +591,79 @@ def _bridge_media_uri(content: Content) -> str | None:
             return None
 
 
-def validate_bridge_media(bridge: AgentBridge, messages: Sequence[ChatMessage]) -> None:
-    """Reject inbound media the host would dereference on the agent's behalf.
+def _bridge_media_mime_type(content: Content) -> str | None:
+    if isinstance(content, ContentAudio):
+        return "audio/mpeg" if content.format == "mp3" else "audio/wav"
+    elif isinstance(content, ContentVideo):
+        return {
+            "mp4": "video/mp4",
+            "mpeg": "video/mpeg",
+            "mov": "video/quicktime",
+        }[content.format]
+    elif isinstance(content, ContentDocument):
+        return content.mime_type or None
+    else:
+        return None
+
+
+def _set_bridge_media_uri(content: Content, uri: str) -> None:
+    match content:
+        case ContentImage():
+            content.image = uri
+        case ContentDocument():
+            content.document = uri
+            content.mime_type = data_uri_mime_type(uri) or content.mime_type
+        case ContentAudio():
+            content.audio = uri
+        case ContentVideo():
+            content.video = uri
+
+
+async def validate_bridge_media(
+    bridge: AgentBridge, messages: Sequence[ChatMessage]
+) -> None:
+    """Reject or explicitly materialize inbound bridge media.
 
     Media content carries a URI that gets resolved outside the sandbox: an http(s)
-    URL is fetched by the Inspect process (or by the provider), and anything else
-    is read from the host filesystem via fsspec. For a sandboxed agent that is a
-    confused deputy — it turns an ordinary model request into an arbitrary read
-    performed by a process the sandbox is not supposed to reach. Only inline
-    `data:` URIs are accepted there.
+    URL may be fetched and anything else may be read from the host filesystem via
+    fsspec. For a sandboxed agent that is a confused deputy — it turns an ordinary
+    model request into an arbitrary read performed by a process the sandbox is not
+    supposed to reach. Only inline `data:` URIs are accepted by default.
 
-    In-process bridges are exempt: that scaffold already runs with the host's
-    filesystem and network, so there is no boundary here to defend.
+    When remote media is enabled, the bridge itself materializes each reference
+    before the request reaches the model. This keeps provider serialization
+    inline-only while preserving the explicitly granted host access.
     """
-    if bridge.allow_remote_media:
-        return
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if isinstance(message.content, str):
             continue
-        for content in message.content:
+        for content_index, content in enumerate(message.content):
+            if isinstance(content, ContentText):
+                if (
+                    isinstance(content.internal, dict)
+                    and "agent_message" in content.internal
+                ):
+                    try:
+                        validate_agent_message(content.internal["agent_message"])
+                    except ValueError as ex:
+                        raise BridgePolicyError(str(ex)) from ex
+                continue
             uri = _bridge_media_uri(content)
-            if uri is not None and not is_data_uri(uri):
+            if uri is None or is_data_uri(uri):
+                continue
+            if not bridge.allow_remote_media:
                 raise BridgePolicyError(
-                    f"Bridged {content.type} content must be an inline 'data:' URI; "
-                    f"the agent bridge will not dereference {uri[:80]!r}."
+                    f"Bridged {content.type} content at message index "
+                    f"{message_index}, content index {content_index} must be an "
+                    "inline 'data:' URI; the agent bridge will not dereference "
+                    "a non-inline reference."
                 )
+            _set_bridge_media_uri(
+                content,
+                await materialize_media(
+                    uri, mime_type=_bridge_media_mime_type(content)
+                ),
+            )
 
 
 def apply_message_ids(bridge: AgentBridge, messages: list[ChatMessage]) -> None:

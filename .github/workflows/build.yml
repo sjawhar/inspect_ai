@@ -276,12 +276,12 @@ jobs:
         if: ${{ !cancelled() && env.RUN_TESTS == 'true' }}
         run: uv cache prune --ci
 
-  # Fast, self-contained unit tests for the injected sandbox-tools package
-  # (notably the model proxy). These live under src/inspect_sandbox_tools/ with
-  # the package's own pytest config (asyncio_mode=auto) and cannot run under the
-  # root `test` job, whose anyio conftest blocks @pytest.mark.asyncio. Runs on
-  # any change to the package — including test-only changes — and needs no
-  # Docker or a built binary (unlike the slow-tool-tests-* jobs below).
+  # Tests for the injected sandbox-tools package. These live under
+  # src/inspect_sandbox_tools/ with the package's own pytest config and dev
+  # dependencies; the root `test` job neither installs this package nor
+  # collects its tests. Runs on any change to the package — including test-only
+  # changes — and needs no Docker or built binary (unlike the
+  # slow-tool-tests-* jobs below).
   sandbox-tools-unit:
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.sandbox_tools == 'true'
@@ -298,14 +298,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install sandbox-tools package (with dev deps)
-        # Its own project so pytest resolves the package's pyproject as config
-        # (asyncio_mode=auto) instead of the repo-root anyio config.
         run: |-
           uv venv
           uv pip install "./src/inspect_sandbox_tools[dev]"
 
       - name: Test with pytest
-        run: uv run pytest src/inspect_sandbox_tools/tests/agent_bridge/ -rA --color=yes
+        run: uv run pytest src/inspect_sandbox_tools/tests/ -rA --color=yes
 
       - name: Minimize uv cache
         if: ${{ !cancelled() }}
@@ -365,10 +363,6 @@ jobs:
               - "src/inspect_ai/util/_checkpoint/**"
               - "tests/checkpoint/**"
 
-  # Fast gate: confirm sandbox_tools_version.txt is bumped to exactly N+1
-  # when the injectable source changed. Blocks downstream slow jobs on
-  # failure so PR contributors don't wait on a Docker build to learn they
-  # forgot the bump.
   check-version-bump:
     needs: detect-slow
     if: needs.detect-slow.outputs.tools_changed == 'true'
@@ -381,29 +375,29 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Check version bump
+      - name: Check fork revision bump
         id: bump
         env:
           INJECTABLE_SRC_CHANGED: ${{ needs.detect-slow.outputs.injectable_src_changed }}
           BASE_REF: ${{ github.base_ref }}
         run: |
-          VERSION_PATH="src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt"
-          BASE_VERSION=$(git show "origin/${BASE_REF}:${VERSION_PATH}" | tr -d '[:space:]')
-          PR_VERSION=$(tr -d '[:space:]' < "${VERSION_PATH}")
-          EXPECTED=$((BASE_VERSION + 1))
-          echo "Base (${BASE_REF}): v${BASE_VERSION}; PR: v${PR_VERSION}; expected on bump: v${EXPECTED}; injectable_src_changed=${INJECTABLE_SRC_CHANGED}"
+          REVISION_PATH="src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt"
+          BASE_REVISION=$(git show "origin/${BASE_REF}:${REVISION_PATH}" | tr -d '[:space:]')
+          PR_REVISION=$(tr -d '[:space:]' < "${REVISION_PATH}")
+          EXPECTED=$((BASE_REVISION + 1))
+          echo "Base (${BASE_REF}): tl${BASE_REVISION}; PR: tl${PR_REVISION}; expected on bump: tl${EXPECTED}; injectable_src_changed=${INJECTABLE_SRC_CHANGED}"
           if [ "$INJECTABLE_SRC_CHANGED" = "true" ]; then
-            if [ "$PR_VERSION" = "$EXPECTED" ]; then
+            if [ "$PR_REVISION" = "$EXPECTED" ]; then
               echo "correctly_bumped=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::src/inspect_sandbox_tools/ changed but ${VERSION_PATH} is v${PR_VERSION}; bump it to v${EXPECTED}."
+              echo "::error::src/inspect_sandbox_tools/ executable source changed but ${REVISION_PATH} is tl${PR_REVISION}; bump it to tl${EXPECTED}."
               exit 1
             fi
           else
-            if [ "$PR_VERSION" = "$BASE_VERSION" ]; then
+            if [ "$PR_REVISION" = "$BASE_REVISION" ]; then
               echo "correctly_bumped=false" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::${VERSION_PATH} changed to v${PR_VERSION} but src/inspect_sandbox_tools/ is unchanged. Either revert the version change or include the injectable source change."
+              echo "::error::${REVISION_PATH} changed to tl${PR_REVISION} but the executable source is unchanged. Either revert the revision change or include an executable source change."
               exit 1
             fi
           fi
@@ -509,12 +503,14 @@ jobs:
       - name: Fetch published non-dev sandbox-tools binaries (glibc + musl)
         run: |
           VERSION=$(tr -d '[:space:]' < src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt)
+          FORK_REVISION=$(tr -d '[:space:]' < src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt)
+          BASE_URL="${INSPECT_SANDBOX_TOOLS_BASE_URL:-https://TODO-fork-sandbox-tools-bucket.invalid}"
           mkdir -p src/inspect_ai/binaries
           # Both libc variants: the slow suite includes an Alpine (musl) case.
           for FILENAME in \
-            "inspect-sandbox-tools-amd64-v${VERSION}" \
-            "inspect-sandbox-tools-amd64-musl-v${VERSION}"; do
-            URL="https://inspect-sandbox-tools.s3.us-east-2.amazonaws.com/${FILENAME}"
+            "inspect-sandbox-tools-amd64-v${VERSION}-tl${FORK_REVISION}" \
+            "inspect-sandbox-tools-amd64-musl-v${VERSION}-tl${FORK_REVISION}"; do
+            URL="${BASE_URL}/${FILENAME}"
             if ! curl -fsI "$URL" >/dev/null; then
               echo "::error::Published binary ${FILENAME} not found at ${URL}. Run: python src/inspect_ai/tool/_sandbox_tools_utils/upload_to_s3.py ${VERSION} then rerun this job."
               exit 1
