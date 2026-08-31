@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Logging: Reduced memory usage and event-loop stalls when finalizing long samples with realtime logging; summary-only hooks can opt out of full-sample materialization via `Hooks.needs_full_sample`.
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
 
 ## 0.3.265 (17 September 2026)
