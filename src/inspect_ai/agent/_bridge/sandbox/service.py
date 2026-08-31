@@ -1,5 +1,5 @@
 from logging import getLogger  # noqa: E402
-from typing import Awaitable, Callable, Sequence, cast
+from typing import Awaitable, Callable, Protocol, Sequence, cast
 
 import anyio
 from pydantic import JsonValue, TypeAdapter
@@ -16,6 +16,7 @@ from inspect_ai.util._sandbox import SandboxEnvironment, sandbox_service
 
 from .._errors import PROVIDER_ERROR_KEY, provider_error_payload
 from ..anthropic_api import inspect_anthropic_api_request
+from ..bridge import filter_bridge_headers
 from ..completions import inspect_completions_api_request
 from ..google_api import inspect_google_api_request
 from ..responses import inspect_responses_api_request
@@ -26,7 +27,13 @@ logger = getLogger(__name__)
 MODEL_SERVICE = "bridge_model_service"
 JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
-GenerateMethod = Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]
+
+class GenerateMethod(Protocol):
+    async def __call__(
+        self,
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]: ...
 
 
 def _forward_provider_errors(
@@ -50,9 +57,10 @@ def _forward_provider_errors(
 
     async def generate_forwarding_errors(
         json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
     ) -> dict[str, JsonValue]:
         try:
-            return await generate(json_data)
+            return await generate(json_data, headers)
         except LimitExceededError:
             raise
         except ModelRefusalError as ex:
@@ -116,9 +124,14 @@ async def run_model_service(
 
 def generate_completions(
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        completion = await inspect_completions_api_request(json_data, None, bridge)
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]:
+        completion = await inspect_completions_api_request(
+            json_data, filter_bridge_headers(headers), bridge
+        )
         return completion.model_dump(mode="json", warnings=False)
 
     return generate
@@ -128,10 +141,17 @@ def generate_responses(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]:
         completion = await inspect_responses_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -142,10 +162,17 @@ def generate_anthropic(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]:
         completion = await inspect_anthropic_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -156,8 +183,12 @@ def generate_google(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, JsonValue]:
+        del headers
         completion = await inspect_google_api_request(
             json_data, web_search, code_execution, bridge
         )
