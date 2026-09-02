@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
+- Anthropic: Structured output requests whose response schema has an optional (nullable) field no longer fail with HTTP 400; `additionalProperties: false` is now applied to object nodes only.
 
 ## 0.3.265 (17 September 2026)
 
