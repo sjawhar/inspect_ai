@@ -16,6 +16,7 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Final,
     Iterator,
     Literal,
     Mapping,
@@ -1943,6 +1944,7 @@ class Model:
             cache=cache,
             call=call,
             pending=output is None,
+            metadata=model_event_metadata(),
         )
         sink = _model_event_sink.get()
         if sink is None:
@@ -2800,6 +2802,68 @@ def use_model_event_sink(sink: ModelEventSink | None) -> Iterator[None]:
         yield
     finally:
         _model_event_sink.reset(token)
+
+
+BRIDGE_REQUESTED_MODEL: Final = "bridge_requested_model"
+"""`ModelEvent.metadata` key: the model name the bridged client asked for.
+
+Alias resolution can map a client-requested name onto a different Inspect model
+(e.g. codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
+which otherwise erases the requested name from the transcript -- leaving
+reviewer turns indistinguishable from the agent's own.
+
+Absent on events whose request was not bridged or carried no model name:
+consumers must treat absence as "not aliased" (the event's `model` is what the
+client asked for), never as "unknown".
+"""
+
+BRIDGE_FILTER_SYNTHETIC: Final = "bridge_filter_synthetic"
+"""`ModelEvent.metadata` key: `True` when a bridge filter produced this output.
+
+No provider request was made (`call` is `None`), but the scaffold consumed the
+output, so the event exists to keep the resulting assistant message traceable.
+"""
+
+
+_model_event_metadata: ContextVar[dict[str, Any] | None] = ContextVar(
+    "_model_event_metadata", default=None
+)
+
+
+def model_event_metadata() -> dict[str, Any] | None:
+    """Extra metadata stamped onto `ModelEvent`s emitted in the current context.
+
+    Returns a copy so a caller mutating the result cannot retroactively alter
+    events already constructed from the same context.
+    """
+    metadata = _model_event_metadata.get()
+    return dict(metadata) if metadata is not None else None
+
+
+@contextlib.contextmanager
+def use_model_event_metadata(metadata: dict[str, Any] | None) -> Iterator[None]:
+    """Stamp *metadata* onto every `ModelEvent` emitted in this block.
+
+    Merges over (and overrides key collisions with) any metadata installed by
+    an enclosing block. Works identically for transcript-emitted events and
+    events routed through a `ModelEventSink` — the stamp happens at event
+    construction, before routing. Passing `None` or `{}` is a no-op.
+
+    The agent bridge uses this to preserve the client-requested model name on
+    bridged generates: alias resolution (e.g. codex's `codex-auto-review`
+    guardian slug onto the eval model) otherwise erases the requested name
+    from the transcript entirely, leaving reviewer and agent turns
+    indistinguishable.
+    """
+    if not metadata:
+        yield
+        return
+    merged = {**(_model_event_metadata.get() or {}), **metadata}
+    token = _model_event_metadata.set(merged)
+    try:
+        yield
+    finally:
+        _model_event_metadata.reset(token)
 
 
 # shared contexts for asyncio tasks

@@ -30,6 +30,8 @@ from inspect_ai.model._agent_message import validate_agent_message
 from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
 from inspect_ai.model._generate_config import GenerateConfig, active_generate_config
 from inspect_ai.model._model import (
+    BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
     Model,
@@ -37,6 +39,7 @@ from inspect_ai.model._model import (
     active_model,
     get_model,
     model_roles,
+    use_model_event_metadata,
     use_model_event_sink,
 )
 from inspect_ai.model._model_output import ModelOutput
@@ -232,6 +235,45 @@ def _restore_operator_message_source(
         bridge._pending_operator = 0
 
 
+def _record_filter_answered_interaction(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+    output: ModelOutput,
+) -> None:
+    """Record a ModelEvent for output a bridge filter produced without generating.
+
+    The event carries the real ``ModelOutput`` the scaffold consumes, so a
+    transcript consumer can trace the resulting assistant message back to it by
+    content. ``call`` stays ``None`` (no provider request was made) and
+    ``BRIDGE_FILTER_SYNTHETIC`` marks the event, so a consumer counting real
+    provider round-trips can exclude it.
+    """
+    tool_info = [
+        tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+        for tool in tools
+    ]
+    with (
+        use_model_event_sink(bridge.model_event_sink),
+        use_model_event_metadata({BRIDGE_FILTER_SYNTHETIC: True}),
+    ):
+        # _record_model_interaction self-completes when given output (it ends
+        # with `if output: complete(output, call)`), so no explicit complete()
+        # here -- a second call would forward the event through the sink twice.
+        _ = model._record_model_interaction(  # pyright: ignore[reportPrivateUsage]  # bridge is in-package; no public recorder exists
+            input=input,
+            tools=tool_info,
+            tool_choice=tool_choice if tool_choice is not None else "auto",
+            config=config,
+            cache=None,
+            output=output,
+            call=None,
+        )
+
+
 async def bridge_generate(
     bridge: AgentBridge,
     model: Model,
@@ -239,6 +281,7 @@ async def bridge_generate(
     tools: Sequence[ToolInfo | Tool],
     tool_choice: ToolChoice | None,
     config: GenerateConfig,
+    requested_model: str | None = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     """Generate model output through the agent bridge.
 
@@ -253,6 +296,26 @@ async def bridge_generate(
     rejected and generation is retried, so the scaffold sees only the replacement (see
     `_approval.apply_bridge_tool_approval`).
     """
+    # Stamp the client-requested model onto every ModelEvent emitted below.
+    # `model` here is the RESOLVED Inspect model: alias resolution may have
+    # mapped the requested name onto a different one (e.g. codex's hardcoded
+    # `codex-auto-review` guardian slug onto the eval model), and without this
+    # the requested name never reaches the transcript -- so a reviewer turn is
+    # indistinguishable from the agent's own.
+    with use_model_event_metadata(
+        {BRIDGE_REQUESTED_MODEL: requested_model} if requested_model else None
+    ):
+        return await _bridge_generate(bridge, model, input, tools, tool_choice, config)
+
+
+async def _bridge_generate(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+) -> tuple[ModelOutput, ChatMessageUser | None]:
     # restore operator provenance lost to a bridged scaffold's round-trip (e.g.
     # claude_code re-emits an operator message as a plain user message). Done
     # before compaction/recording so the restored source persists in both the
@@ -319,6 +382,18 @@ async def bridge_generate(
                     tools=tools,
                     config=config,
                 )
+        else:
+            # The filter answered instead of the provider, so `generate()` never
+            # ran and recorded nothing. Record the interaction anyway: the
+            # scaffold consumes this output, so a grader reading the transcript
+            # otherwise sees an assistant message that no ModelEvent accounts
+            # for -- indistinguishable from a message the agent never produced,
+            # or from a foreign injection. `call=None` plus the
+            # BRIDGE_FILTER_SYNTHETIC metadata flag distinguish it from a real
+            # provider round-trip.
+            _record_filter_answered_interaction(
+                bridge, model, input_messages, tools, tool_choice, config, output
+            )
 
         # Update the compaction baseline with the actual input token
         # count from the generate call (most accurate source of truth)
