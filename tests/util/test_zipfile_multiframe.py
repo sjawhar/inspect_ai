@@ -23,6 +23,10 @@ from test_helpers.zstd import (
 # Importing this module installs the zstd compression patches (both the
 # zipfile_zstd delegation on Python < 3.14 and our multi-frame wrapper).
 import inspect_ai._util.zipfile
+from inspect_ai._util.zipfile import (
+    _MultiFrameZstdCompressObj,
+    _MultiFrameZstdDecompressObj,
+)
 
 MAX_INPUT_PER_FRAME = 200 * 1024 * 1024  # must match the value in _util/zipfile.py
 
@@ -173,3 +177,74 @@ def test_zip_member_read_paths_round_trip(
 
         with zf.open("entry.json") as fp:
             assert b"".join(iter(fp.readline, b"")) == payload
+
+
+def _multiframe_stream(
+    monkeypatch: pytest.MonkeyPatch, payload: bytes, frame_cap: int
+) -> bytes:
+    """Compress ``payload`` with the production compressor at a small frame cap."""
+    monkeypatch.setattr(inspect_ai._util.zipfile, "_MAX_INPUT_PER_FRAME", frame_cap)
+    obj = _MultiFrameZstdCompressObj(zstandard.ZstdCompressor(level=3).compressobj)
+    compressed = obj.compress(payload) + obj.flush()
+    assert compressed.count(ZSTD_MAGIC) >= 3, "fixture must be multi-frame"
+    return compressed
+
+
+def test_needs_input_reports_drained_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """needs_input is True exactly when draining with b"" can yield nothing more.
+
+    The post-gh-156002 ``_read1`` loop sets EOF from ``needs_input`` once the
+    compressed bytes are exhausted, so a True answer while output is still
+    withheld would truncate the member.
+    """
+    payload = moderately_compressible_payload(300 * 1024)
+    compressed = _multiframe_stream(monkeypatch, payload, frame_cap=64 * 1024)
+
+    decompressor = _MultiFrameZstdDecompressObj()
+    assert decompressor.needs_input is True
+
+    head = decompressor.decompress(compressed, 10)
+    assert payload.startswith(head)
+
+    # An implementation may withhold output past max_length; if it does, it
+    # must say so via needs_input, and a b"" drain must return the remainder.
+    withheld = not decompressor.needs_input
+    tail = decompressor.decompress(b"", -1)
+    assert bool(tail) is withheld
+    assert head + tail == payload
+
+    assert decompressor.needs_input is True
+    assert decompressor.decompress(b"", 4096) == b""
+    assert decompressor.eof is False
+    assert decompressor.flush() == b""
+
+
+def test_needs_input_true_when_input_exhausted_mid_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With only part of a frame fed and all output returned, more input is needed."""
+    payload = moderately_compressible_payload(300 * 1024)
+    compressed = _multiframe_stream(monkeypatch, payload, frame_cap=64 * 1024)
+
+    decompressor = _MultiFrameZstdDecompressObj()
+    first = decompressor.decompress(compressed[:1500], 4096)
+    assert payload.startswith(first)
+    rest = decompressor.decompress(b"", -1)
+    assert payload.startswith(first + rest)
+    assert decompressor.needs_input is True
+
+    # Feeding the remainder completes the stream.
+    assert first + rest + decompressor.decompress(compressed[1500:]) == payload
+
+
+def test_legacy_single_arg_decompress_returns_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-gh-156002 zipfile calls decompress(data) once per read; keep that whole."""
+    payload = moderately_compressible_payload(300 * 1024)
+    compressed = _multiframe_stream(monkeypatch, payload, frame_cap=64 * 1024)
+
+    decompressor = _MultiFrameZstdDecompressObj()
+    assert decompressor.decompress(compressed) == payload
+    assert decompressor.needs_input is True
+    assert decompressor.eof is False
