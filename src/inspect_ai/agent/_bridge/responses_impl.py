@@ -319,10 +319,7 @@ async def inspect_responses_api_request_impl(
                         _harvest_tool_namespaces(discovered, tool_namespaces)
 
     debug_log("SCAFFOLD INPUT", input)
-    codex_thread_metadata = _codex_thread_metadata(
-        json_data.get("client_metadata")
-    )
-
+    codex_thread_metadata = _codex_thread_metadata(json_data.get("client_metadata"))
 
     messages = messages_from_responses_input(input, tools, model_name)
     await validate_bridge_media(bridge, messages)
