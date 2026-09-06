@@ -1,4 +1,5 @@
-from typing import cast
+from contextlib import AbstractAsyncContextManager
+from typing import Callable, cast
 
 import anyio
 
@@ -21,6 +22,7 @@ def human_cli(
     user: str | None = None,
     instructions: str | None = None,
     bashrc: str | None = None,
+    on_ready: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> Agent:
     """Human CLI agent for tasks that run in a sandbox.
 
@@ -43,6 +45,8 @@ def human_cli(
        user: User to login as. Defaults to the sandbox environment's default user.
        instructions: Additional instructions beyond the default task command instructions.
        bashrc: Additional content to include in the .bashrc file for the human cli shell.
+       on_ready: Optional async context manager entered after the human command
+          service is available in the sandbox and exited when the session ends.
 
     Returns:
        Agent: Human CLI agent.
@@ -82,7 +86,9 @@ def human_cli(
                     view.connect(connection)
 
                     # run sandbox service
-                    return await run_human_agent_service(user, state, commands, view)
+                    return await run_human_agent_service(
+                        user, state, commands, view, on_ready
+                    )
 
             # support both fullscreen ui and fallback
             if display_type() == "full":

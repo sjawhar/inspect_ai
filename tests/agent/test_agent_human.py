@@ -6,20 +6,25 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, overload
 from uuid import uuid4
 
+import anyio
 import pytest
 from test_helpers.sandbox import CannedSandbox
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai import Task, eval
 from inspect_ai.agent._human import install as human_install
+from inspect_ai.agent import AgentState
+from inspect_ai.agent._human import service as human_service
 from inspect_ai.agent._human.agent import human_cli
 from inspect_ai.agent._human.commands import submit
 from inspect_ai.agent._human.commands.command import HumanAgentCommand
@@ -54,6 +59,10 @@ from inspect_ai.util._sandbox.environment import (
 )
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._subprocess import ExecResult
+from inspect_ai.util import sandbox
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 
 @pytest.mark.parametrize(
@@ -1004,10 +1013,26 @@ async def test_docker_install_refuses_bashrc_symlink(
 @pytest.mark.slow
 @skip_if_no_docker
 @pytest.mark.parametrize("user", ["root", "nonroot", None])
-def test_human_cli(capsys: pytest.CaptureFixture[str], user: str | None):
+def test_human_cli(user: str | None) -> None:
+    ready = threading.Event()
+    closed = threading.Event()
+    container_name: str | None = None
+
+    @asynccontextmanager
+    async def on_ready() -> AsyncIterator[None]:
+        nonlocal container_name
+        connection = await sandbox().connection(user=user)
+        assert connection.container is not None
+        container_name = connection.container
+        ready.set()
+        try:
+            yield
+        finally:
+            closed.set()
+
     def run_eval():
         task = Task(
-            solver=human_cli(user=user),
+            solver=human_cli(user=user, on_ready=on_ready),
             sandbox=(
                 "docker",
                 (Path(__file__).parent / "compose.human.yaml").as_posix(),
@@ -1018,18 +1043,8 @@ def test_human_cli(capsys: pytest.CaptureFixture[str], user: str | None):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         future = executor.submit(run_eval)
 
-        out = ""
-        container_name = None
-        for _ in range(10):
-            out += capsys.readouterr().out
-            if match := re.search(r"inspect-task-\S+-default-1", out):
-                container_name = match.group(0)
-                break
-            time.sleep(1)
-
-        if not container_name:
-            raise Exception("Failed to find container name")
-
+        assert ready.wait(timeout=60)
+        assert container_name is not None
         docker_exec = [
             "docker",
             "exec",
@@ -1040,21 +1055,8 @@ def test_human_cli(capsys: pytest.CaptureFixture[str], user: str | None):
             "-c",
         ]
 
-        human_agent_found = False
-        for _ in range(10):
-            result = subprocess.run(
-                docker_exec
-                + ["ls /var/tmp/sandbox-services/human_agent/human_agent.py"]
-            )
-            if result.returncode == 0:
-                human_agent_found = True
-                break
-            time.sleep(1)
-
-        if not human_agent_found:
-            raise Exception("Human agent sandbox service not found")
-
         subprocess.check_call(docker_exec + ["python3 /opt/human_agent/task.py start"])
+        assert not closed.is_set()
         subprocess.check_call(
             docker_exec
             + [
@@ -1067,8 +1069,152 @@ def test_human_cli(capsys: pytest.CaptureFixture[str], user: str | None):
             log = future.result()
             assert log.status == "success"
             assert log.samples[0].output.choices[0].message.content == "test"
+            assert closed.is_set()
         else:
             raise Exception("eval() did not complete within timeout")
+
+async def test_human_cli_ready_context_waits_for_service_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_entered = anyio.Event()
+
+    class ServiceFailure(Exception):
+        pass
+
+    async def fake_sandbox_service(**_: object) -> None:
+        raise ServiceFailure("human service failed before startup")
+
+    @asynccontextmanager
+    async def on_ready() -> AsyncIterator[None]:
+        context_entered.set()
+        yield
+
+    def no_clock_action_event(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(human_service, "clock_action_event", no_clock_action_event)
+    monkeypatch.setattr(human_service, "sandbox", object)
+    monkeypatch.setattr(human_service, "sandbox_service", fake_sandbox_service)
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await human_service.run_human_agent_service(
+            None, AgentState(messages=[]), [], None, on_ready=on_ready
+        )
+
+    assert any(
+        isinstance(error, ServiceFailure) for error in exc_info.value.exceptions
+    )
+    assert not context_entered.is_set()
+
+
+
+async def test_human_cli_without_ready_preserves_service_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ServiceFailure(Exception):
+        pass
+
+    async def fake_sandbox_service(**_: object) -> None:
+        raise ServiceFailure("human service failed before startup")
+
+    def no_clock_action_event(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(human_service, "clock_action_event", no_clock_action_event)
+    monkeypatch.setattr(human_service, "sandbox", object)
+    monkeypatch.setattr(human_service, "sandbox_service", fake_sandbox_service)
+
+    with pytest.raises(ServiceFailure, match="before startup"):
+        await human_service.run_human_agent_service(
+            None, AgentState(messages=[]), [], None
+        )
+
+
+async def test_human_cli_ready_context_closes_after_service_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_entered = anyio.Event()
+    context_exited = anyio.Event()
+
+    class ServiceFailure(Exception):
+        pass
+
+    async def fake_sandbox_service(
+        *, started: anyio.Event | None = None, **_: object
+    ) -> None:
+        assert started is not None
+        started.set()
+        await context_entered.wait()
+        raise ServiceFailure("human service failed")
+
+    @asynccontextmanager
+    async def on_ready() -> AsyncIterator[None]:
+        context_entered.set()
+        try:
+            yield
+        finally:
+            context_exited.set()
+
+    def no_clock_action_event(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(human_service, "clock_action_event", no_clock_action_event)
+    monkeypatch.setattr(human_service, "sandbox", object)
+    monkeypatch.setattr(human_service, "sandbox_service", fake_sandbox_service)
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await human_service.run_human_agent_service(
+            None, AgentState(messages=[]), [], None, on_ready=on_ready
+        )
+
+    assert any(
+        isinstance(error, ServiceFailure) for error in exc_info.value.exceptions
+    )
+    assert context_exited.is_set()
+
+
+async def test_human_cli_ready_context_closes_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_entered = anyio.Event()
+    context_exited = anyio.Event()
+
+    async def fake_sandbox_service(
+        *, started: anyio.Event | None = None, **_: object
+    ) -> None:
+        assert started is not None
+        started.set()
+        await context_entered.wait()
+        await anyio.sleep_forever()
+
+    @asynccontextmanager
+    async def on_ready() -> AsyncIterator[None]:
+        context_entered.set()
+        try:
+            yield
+        finally:
+            context_exited.set()
+
+    def no_clock_action_event(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(human_service, "clock_action_event", no_clock_action_event)
+    monkeypatch.setattr(human_service, "sandbox", object)
+    monkeypatch.setattr(human_service, "sandbox_service", fake_sandbox_service)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(
+            human_service.run_human_agent_service,
+            None,
+            AgentState(messages=[]),
+            [],
+            None,
+            on_ready,
+        )
+        await context_entered.wait()
+        task_group.cancel_scope.cancel()
+
+    assert context_exited.is_set()
 
 
 @pytest.mark.slow
