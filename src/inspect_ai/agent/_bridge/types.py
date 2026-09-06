@@ -38,6 +38,40 @@ if TYPE_CHECKING:
     from inspect_ai.approval._policy import ApprovalPolicy
 
 
+_SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
+    "authorization",
+    "cookie",
+    "credential",
+    "key",
+    "secret",
+    "token",
+)
+
+
+def _normalize_model_event_metadata_headers(
+    headers: Sequence[str] | None,
+) -> frozenset[str]:
+    """Validate and normalize headers that may enter `ModelEvent` metadata."""
+    if headers is None:
+        return frozenset()
+    if isinstance(headers, str):
+        raise ValueError("model event metadata headers must be a sequence of names")
+
+    normalized: set[str] = set()
+    for header in headers:
+        if not isinstance(header, str):
+            raise ValueError("model event metadata headers must be strings")
+        name = header.strip().lower()
+        if not name:
+            raise ValueError("model event metadata headers cannot be empty")
+        if any(part in name for part in _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS):
+            raise ValueError(
+                "model event metadata headers cannot include sensitive headers"
+            )
+        normalized.add(name)
+    return frozenset(normalized)
+
+
 class AgentBridge:
     """Agent bridge."""
 
@@ -56,6 +90,7 @@ class AgentBridge:
         allow_remote_mcp: bool = True,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        model_event_metadata_headers: Sequence[str] | None = None,
     ) -> None:
         # Capabilities a client-declared request may reach for. Media defaults
         # closed so new bridge subclasses cannot accidentally grant host I/O.
@@ -106,6 +141,9 @@ class AgentBridge:
         self.model_aliases: dict[str, str | Model] = model_aliases or {}
         self.model_resolver = model_resolver
         self.model_event_sink = model_event_sink
+        self.model_event_metadata_headers = _normalize_model_event_metadata_headers(
+            model_event_metadata_headers
+        )
         self.forward_generation_config = forward_generation_config
         self.approval = approval
         self._compaction = compaction
@@ -162,6 +200,15 @@ class AgentBridge:
     complete events to the sink instead of emitting them to the transcript.
     Use this to attribute bridge model events to externally-managed agent
     spans (e.g. spans driven by a side-channel event stream).
+    """
+
+    model_event_metadata_headers: frozenset[str]
+    """Lower-case inbound header names copied into bridged `ModelEvent` metadata.
+
+    Empty by default. When configured, a bridge copies only these names from
+    the request's `GenerateConfig.extra_headers` into the
+    `BRIDGE_REQUEST_HEADERS` metadata mapping. Sensitive header names are
+    rejected at construction.
     """
 
     forward_generation_config: bool

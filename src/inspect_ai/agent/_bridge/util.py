@@ -37,6 +37,7 @@ from inspect_ai.model._generate_config import (
 )
 from inspect_ai.model._model import (
     BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
     BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
@@ -521,6 +522,21 @@ def _record_filter_answered_interaction(
         )
 
 
+def _bridge_request_metadata(
+    bridge: AgentBridge, config: GenerateConfig
+) -> dict[str, dict[str, str]]:
+    """Select configured non-sensitive request headers for event metadata."""
+    if not bridge.model_event_metadata_headers or config.extra_headers is None:
+        return {}
+
+    selected = {
+        name: config.extra_headers[name]
+        for name in bridge.model_event_metadata_headers
+        if name in config.extra_headers
+    }
+    return {BRIDGE_REQUEST_HEADERS: selected} if selected else {}
+
+
 async def bridge_generate(
     bridge: AgentBridge,
     model: Model,
@@ -543,15 +559,16 @@ async def bridge_generate(
     rejected and generation is retried, so the scaffold sees only the replacement (see
     `_approval.apply_bridge_tool_approval`).
     """
-    # Stamp the client-requested model onto every ModelEvent emitted below.
-    # `model` here is the RESOLVED Inspect model: alias resolution may have
-    # mapped the requested name onto a different one (e.g. codex's hardcoded
-    # `codex-auto-review` guardian slug onto the eval model), and without this
-    # the requested name never reaches the transcript -- so a reviewer turn is
-    # indistinguishable from the agent's own.
-    with use_model_event_metadata(
-        {BRIDGE_REQUESTED_MODEL: requested_model} if requested_model else None
-    ):
+    # Stamp the client-requested model and configured request metadata onto every
+    # ModelEvent emitted below. `model` here is the RESOLVED Inspect model: alias
+    # resolution may have mapped the requested name onto a different one (e.g.
+    # codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
+    # and without this the requested name never reaches the transcript -- so a
+    # reviewer turn is indistinguishable from the agent's own.
+    metadata: dict[str, Any] = _bridge_request_metadata(bridge, config)
+    if requested_model:
+        metadata[BRIDGE_REQUESTED_MODEL] = requested_model
+    with use_model_event_metadata(metadata):
         return await _bridge_generate(bridge, model, input, tools, tool_choice, config)
 
 
