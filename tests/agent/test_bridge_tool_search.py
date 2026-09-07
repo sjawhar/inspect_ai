@@ -13,13 +13,22 @@ from typing import Any, cast
 
 from openai.types.responses import ResponseInputItemParam, ToolParam
 
+from inspect_ai.agent._agent import AgentState
+from inspect_ai.agent._bridge.responses import inspect_responses_api_request
 from inspect_ai.agent._bridge.responses_impl import (
     messages_from_responses_input,
     responses_output_items_from_assistant_message,
     tool_from_responses_tool,
 )
-from inspect_ai.model._chat_message import ChatMessageAssistant, ChatMessageTool
+from inspect_ai.agent._bridge.types import AgentBridge
+from inspect_ai.model._chat_message import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageTool,
+)
 from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.model._model import get_model
+from inspect_ai.model._model_output import ModelOutput
 from inspect_ai.model._openai_responses import (
     TOOL_SEARCH_NAME,
     TOOL_SEARCH_OPTIONS_MARKER,
@@ -30,6 +39,7 @@ from inspect_ai.model._openai_responses import (
     is_tool_search_tool_param,
     maybe_tool_search_tool,
 )
+from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tool_info import ToolInfo
 
@@ -44,7 +54,21 @@ def _tool_search_tool_param() -> ToolParam:
             "type": "tool_search",
             "description": "Search for available tools",
             "execution": "client",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of tools to return. Defaults to 8.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for deferred tools.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
         },
     )
 
@@ -63,6 +87,120 @@ def _discoverable_function_tool() -> dict[str, Any]:
     }
 
 
+def _deferred_mcp_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": "mcp__agent_c_mcp__browser",
+        "description": "Control the task browser through agent-c-mcp.",
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        "strict": False,
+    }
+
+
+async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools() -> None:
+    """A client discovery call survives a non-OpenAI bridge continuation."""
+    requested_tool_search = _tool_search_tool_param()
+    discovered_mcp_tool = _deferred_mcp_tool()
+    tool_names_seen: list[set[str]] = []
+    outputs = iter(
+        [
+            ModelOutput.for_tool_call(
+                "mockllm/model",
+                TOOL_SEARCH_NAME,
+                {"query": "browser tools", "limit": 8},
+                tool_call_id="tool_search_1",
+            ),
+            ModelOutput.for_tool_call(
+                "mockllm/model",
+                discovered_mcp_tool["name"],
+                {"action": "screenshot"},
+                tool_call_id="browser_1",
+            ),
+        ]
+    )
+
+    def custom_outputs(
+        _input: list[ChatMessage],
+        tools: list[ToolInfo],
+        _tool_choice: ToolChoice,
+        _config: GenerateConfig,
+    ) -> ModelOutput:
+        names = {tool.name for tool in tools}
+        tool_names_seen.append(names)
+        if len(tool_names_seen) == 1:
+            assert names == {TOOL_SEARCH_NAME}, (
+                "client tool_search missing from the first non-OpenAI bridge generation"
+            )
+        else:
+            assert names == {TOOL_SEARCH_NAME, discovered_mcp_tool["name"]}, (
+                "client-discovered MCP declarations missing from the non-OpenAI "
+                "bridge continuation"
+            )
+        return next(outputs)
+
+    model = get_model("mockllm/model", custom_outputs=custom_outputs)
+    bridge = AgentBridge(
+        AgentState(messages=[]),
+        model_aliases={"inspect": model},
+    )
+    first_response = await inspect_responses_api_request(
+        {
+            "model": "inspect",
+            "input": [{"role": "user", "content": "Find a browser tool."}],
+            "tools": [requested_tool_search],
+        },
+        None,
+        None,
+        None,
+        bridge,
+    )
+
+    assert len(first_response.output) == 1
+    first_call = first_response.output[0]
+    assert first_call.type == "tool_search_call"
+    assert first_call.call_id == "tool_search_1"
+    assert first_call.arguments == {"query": "browser tools", "limit": 8}
+    assert first_call.execution == "client"
+
+    continuation = [
+        {"role": "user", "content": "Find a browser tool."},
+        first_call.model_dump(exclude_none=True),
+        {
+            "type": "tool_search_output",
+            "call_id": first_call.call_id,
+            "tools": [discovered_mcp_tool],
+            "execution": "client",
+            "status": "completed",
+        },
+    ]
+    second_response = await inspect_responses_api_request(
+        {
+            "model": "inspect",
+            "input": continuation,
+            "tools": [requested_tool_search],
+        },
+        None,
+        None,
+        None,
+        bridge,
+    )
+
+    assert tool_names_seen == [
+        {TOOL_SEARCH_NAME},
+        {TOOL_SEARCH_NAME, discovered_mcp_tool["name"]},
+    ]
+    assert len(second_response.output) == 1
+    second_call = second_response.output[0]
+    assert second_call.type == "function_call"
+    assert second_call.name == discovered_mcp_tool["name"]
+    assert second_call.arguments == '{"action": "screenshot"}'
+
+
 # 1. incoming tool_search param -> ToolInfo with marker + verbatim execution
 
 
@@ -79,6 +217,7 @@ def test_tool_from_responses_tool_tool_search() -> None:
     assert tool.options[TOOL_SEARCH_OPTIONS_MARKER] is True
     assert tool.options["execution"] == "client"
     assert tool.options["description"] == "Search for available tools"
+    assert tool.options["parameters"] == _tool_search_tool_param()["parameters"]
 
 
 # 2. ToolInfo -> native ToolSearchToolParam (and None for ordinary tools)
