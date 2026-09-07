@@ -3,7 +3,7 @@ from collections.abc import Iterable
 import json
 from logging import getLogger
 from time import time
-from typing import Any, Set, cast
+from typing import Any, Set, TypeGuard, cast
 
 from openai.types.responses import (
     Response,
@@ -61,6 +61,9 @@ from openai.types.responses.response_output_item import (
     McpCall,
     McpListTools,
     McpListToolsTool,
+)
+from openai.types.responses.response_tool_search_output_item_param_param import (
+    ResponseToolSearchOutputItemParamParam,
 )
 from openai.types.responses.tool_param import CodeInterpreter
 from pydantic import TypeAdapter
@@ -209,7 +212,7 @@ def _is_client_tool_search_output(
     item: ResponseInputItemParam,
     client_tool_search_declared: bool,
     client_tool_search_call_ids: set[str],
-) -> bool:
+) -> TypeGuard[ResponseToolSearchOutputItemParamParam]:
     """Whether a tool_search output is authorized by client-side discovery."""
     return (
         is_tool_search_output(item)
