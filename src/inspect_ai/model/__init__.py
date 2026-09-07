@@ -60,11 +60,16 @@ from ._generate_config import (
 from ._google_convert import messages_from_google, model_output_from_google
 from ._message_ids import stable_message_ids
 from ._model import (
+    BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
+    BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
     Model,
     ModelAPI,
     ModelName,
+    ModelResolver,
+    ModelResponseFilter,
     ModelRoles,
     RetryDecision,
     compute_model_cost,
@@ -110,10 +115,15 @@ from ._stream import (
 from ._trim import trim_messages
 
 __all__ = [
+    "BRIDGE_FILTER_SYNTHETIC",
+    "BRIDGE_REQUEST_HEADERS",
+    "BRIDGE_REQUESTED_MODEL",
     "BatchConfig",
     "GenerateConfig",
     "GenerateConfigArgs",
     "GenerateFilter",
+    "ModelResolver",
+    "ModelResponseFilter",
     "GenerateInput",
     "ImageOutput",
     "OutputModality",

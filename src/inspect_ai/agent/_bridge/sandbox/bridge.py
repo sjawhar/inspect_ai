@@ -8,7 +8,13 @@ from shortuuid import uuid
 
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai.model._compaction.types import CompactionStrategy
-from inspect_ai.model._model import GenerateFilter, Model, ModelEventSink
+from inspect_ai.model._model import (
+    GenerateFilter,
+    Model,
+    ModelEventSink,
+    ModelResolver,
+    ModelResponseFilter,
+)
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
 from inspect_ai.tool._mcp._tools_bridge import BridgedToolsSpec
 from inspect_ai.tool._sandbox_tools_utils.sandbox import sandbox_with_injected_tools
@@ -28,6 +34,7 @@ from inspect_ai.util._sandbox.exec_remote import (
 )
 
 from ..._agent import AgentState
+from ..types import StateFilter
 from ..util import resolve_bridge_code_execution, resolve_bridge_web_search
 from .service import MODEL_SERVICE, run_model_service
 from .types import SandboxAgentBridge
@@ -47,6 +54,7 @@ async def sandbox_agent_bridge(
     *,
     model: str | None = None,
     model_aliases: dict[str, str | Model] | None = None,
+    model_resolver: ModelResolver | None = None,
     filter: GenerateFilter | None = None,
     retry_refusals: int | None = None,
     compaction: CompactionStrategy | None = None,
@@ -57,9 +65,13 @@ async def sandbox_agent_bridge(
     client_mcp_servers: bool | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
     model_event_sink: ModelEventSink | None = None,
+    model_event_metadata_headers: Sequence[str] | None = None,
     forward_generation_config: bool = False,
     approval: list["ApprovalPolicy"] | None = None,
     checkpointer: Checkpointer | None = None,
+    accumulate_conversations: bool = False,
+    response_filter: ModelResponseFilter | None = None,
+    state_filter: StateFilter | None = None,
 ) -> AsyncIterator[SandboxAgentBridge]:
     """Sandbox agent bridge.
 
@@ -80,6 +92,11 @@ async def sandbox_agent_bridge(
         model_aliases: Map of model name aliases. When a request uses a name
             that appears here, the corresponding value (a ``Model`` instance
             or model spec string) is used instead. Checked before the fallback ``model``.
+        model_resolver: Dynamic routing policy called with the requested model
+            name (provider-qualified on a provider-specific endpoint, e.g.
+            ``openai/gpt-5.1``). Checked after ``model_aliases`` and before the ``model``
+            fallback; return a ``Model``/spec to route the request there, or
+            ``None`` to defer. Routes by policy without enumerating every name.
         filter: Filter for bridge model generation.
         retry_refusals: Should refusals be retried? (pass number of times to retry)
         compaction: Compact the conversation when it it is close to overflowing
@@ -113,6 +130,12 @@ async def sandbox_agent_bridge(
             emission for calls routed through the bridge. When set, the bridge
             installs it around `model.generate()` so the sink decides when and
             under which span each event is emitted to the transcript.
+        model_event_metadata_headers: Optional non-sensitive client request
+            header names to copy into each matching bridged `ModelEvent` under
+            `BRIDGE_REQUEST_HEADERS`. Names are normalized to lower case; only
+            these names cross the sandbox RPC boundary as event metadata, never
+            provider headers, and sensitive names such as authorization and cookies
+            are rejected. Defaults to `None`.
         forward_generation_config: Forward client generation parameters (e.g.
             `max_tokens`, `temperature`, reasoning effort) to the model. Defaults
             to `False`, in which case those parameters are dropped and the resolved
@@ -132,6 +155,19 @@ async def sandbox_agent_bridge(
             state (messages, output, compaction prefix) for checkpoint backup
             and restore, so a checkpointed run survives resume. Defaults to
             `None` (no checkpointing).
+        accumulate_conversations: Keep every conversation observed over the bridge
+            rather than tracking a single main one. Defaults to `False`, which surfaces
+            the main agent loop and treats other traffic as side calls. Set `True` when
+            the sandbox may run several independent conversations: `state.messages`
+            then holds each in the order they started.
+        response_filter: Filter that mutates model output after generation.
+            Called inside the refusal-retry loop, after ``model.generate()``
+            and after the compaction baseline update. Return ``None`` to pass
+            through; return a ``ModelOutput`` to replace the response.
+        state_filter: Optional predicate that selects client requests whose
+            generations update the yielded state's messages and output.
+            Rejected requests still receive normal model responses and model
+            events, and still tick the checkpointer.
     """
     # instance id for this bridge
     instance = f"proxy_{uuid()}"
@@ -170,11 +206,16 @@ async def sandbox_agent_bridge(
                 port=port,
                 model=model,
                 model_aliases=model_aliases,
+                model_resolver=model_resolver,
                 model_event_sink=model_event_sink,
+                model_event_metadata_headers=model_event_metadata_headers,
                 forward_generation_config=forward_generation_config,
                 approval=approval,
                 checkpointer=checkpointer,
                 allow_remote_mcp=allow_remote_mcp,
+                accumulate_conversations=accumulate_conversations,
+                response_filter=response_filter,
+                state_filter=state_filter,
             )
 
             # register bridged tools with the bridge
@@ -211,6 +252,15 @@ async def sandbox_agent_bridge(
                     env={
                         f"{MODEL_SERVICE.upper()}_PORT": str(port),
                         f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
+                        **(
+                            {
+                                "BRIDGE_MODEL_EVENT_METADATA_HEADERS": ",".join(
+                                    sorted(bridge.model_event_metadata_headers)
+                                )
+                            }
+                            if bridge.model_event_metadata_headers
+                            else {}
+                        ),
                     },
                     poll_timeout=600,
                 ),
@@ -227,6 +277,7 @@ async def sandbox_agent_bridge(
                 yield bridge
                 agent_completed = True
             finally:
+                bridge.close_conversation_spans()
                 with anyio.CancelScope(shield=True):
                     # ensure the process terminates (no-op if already dead)
                     await proxy.kill()

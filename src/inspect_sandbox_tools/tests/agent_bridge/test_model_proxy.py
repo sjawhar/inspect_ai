@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, AsyncIterator
 
+import httpx2
 import pytest
 from aiohttp import ClientSession
 from anthropic import AsyncAnthropic
@@ -15,7 +16,7 @@ from inspect_sandbox_tools._agent_bridge.proxy import (
     AsyncHTTPServer,
     model_proxy_server,
 )
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from openai.types.responses import (
     FunctionToolParam,
     ResponseOutputText,
@@ -270,6 +271,87 @@ async def test_model_proxy_request_headers_and_body(
             assert received_request["path"] == "/inspect"
             assert received_request["json"] == test_body
             assert "content-type" in received_request["headers"]
+
+
+@pytest.mark.asyncio
+async def test_model_proxy_forwards_client_headers_to_model_service() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_model_service(method: str, **params: Any) -> dict[str, str]:
+        calls.append((method, params))
+        return {"id": "completion"}
+
+    server = await model_proxy_server(
+        port=0,
+        call_bridge_model_service_async=call_model_service,
+    )
+    handler = server.routes["POST"]["/v1/chat/completions"]
+
+    await handler(
+        {
+            "json": {"model": "inspect", "messages": []},
+            "headers": {"x-claude-code-agent-id": "toolu_x"},
+        }
+    )
+
+    assert calls == [
+        (
+            "generate_completions",
+            {
+                "json_data": {
+                    "model": "inspect",
+                    "messages": [],
+                    "parallel_tool_calls": False,
+                },
+                "headers": {"x-claude-code-agent-id": "toolu_x"},
+                "metadata_headers": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "method"),
+    [
+        (
+            "/v1/responses",
+            {"model": "inspect", "input": "hello"},
+            "generate_responses",
+        ),
+        (
+            "/v1/messages",
+            {"model": "inspect", "messages": [], "max_tokens": 1},
+            "generate_anthropic",
+        ),
+    ],
+)
+async def test_model_proxy_forwards_client_headers_for_other_generation_routes(
+    path: str,
+    body: dict[str, Any],
+    method: str,
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call_model_service(service_method: str, **params: Any) -> dict[str, str]:
+        calls.append((service_method, params))
+        return {"id": "completion"}
+
+    server = await model_proxy_server(
+        port=0,
+        call_bridge_model_service_async=call_model_service,
+    )
+    handler = server.routes["POST"][path]
+
+    await handler(
+        {
+            "json": body,
+            "headers": {"x-claude-code-agent-id": "toolu_x"},
+        }
+    )
+
+    assert calls[0][0] == method
+    assert calls[0][1]["headers"] == {"x-claude-code-agent-id": "toolu_x"}
 
 
 @pytest.mark.asyncio
@@ -645,7 +727,10 @@ async def proxy_server() -> AsyncGenerator[tuple[AsyncHTTPServer, str], None]:
 
     # Mock the bridge service
     async def mock_bridge_service(
-        method: str, json_data: dict[str, Any]
+        method: str,
+        json_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async."""
         if method == "generate_responses":
@@ -1410,7 +1495,10 @@ async def proxy_server_anthropic() -> AsyncGenerator[tuple[AsyncHTTPServer, str]
 
     # Mock the bridge service for Anthropic
     async def mock_bridge_service_anthropic(
-        method: str, json_data: dict[str, Any]
+        method: str,
+        json_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async for Anthropic."""
         if method == "generate_anthropic":
@@ -1694,6 +1782,9 @@ async def test_anthropic_messages_streaming(
     # Check key event types were received
     event_types = {e.type for e in events if hasattr(e, "type")}
     assert "message_start" in event_types
+    message_start = next(event for event in events if event.type == "message_start")
+    assert message_start.message.id == "msg_test123"
+    assert message_start.message.model == "claude-opus-4-1-20250805"
     assert "content_block_start" in event_types
     assert "content_block_delta" in event_types
     assert "content_block_stop" in event_types
@@ -2114,7 +2205,10 @@ async def proxy_server_google() -> AsyncGenerator[tuple[AsyncHTTPServer, str], N
 
     # Mock the bridge service for Google
     async def mock_bridge_service_google(
-        method: str, json_data: dict[str, Any]
+        method: str,
+        json_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async for Google."""
         if method == "generate_google":
@@ -2664,11 +2758,172 @@ async def _proxy_with_service(mock_service: Any) -> AsyncGenerator[str, None]:
             await server.server.wait_closed()
 
 
-def _error_service(status: int | None, message: str) -> Any:
-    """A mock bridge service that always returns a forwarded provider error."""
+@pytest.mark.asyncio
+async def test_model_proxy_routes_client_and_event_metadata_headers_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selected event metadata stays separate from raw client headers."""
+    monkeypatch.setenv(
+        "BRIDGE_MODEL_EVENT_METADATA_HEADERS",
+        "x-opencode-session,x-parent-session-id",
+    )
+    received_requests: list[dict[str, Any]] = []
 
     async def mock_service(method: str, **params: Any) -> dict[str, Any]:
-        return {PROVIDER_ERROR_KEY: {"status": status, "message": message}}
+        assert method == "generate_completions"
+        received_requests.append(params)
+        return {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "inspect",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json={
+                    "model": "inspect",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={
+                    "Authorization": "Bearer must-not-cross-rpc",
+                    "Cookie": "must-not-cross-rpc",
+                    "X-OpenCode-Session": "session-1",
+                    "X-Parent-Session-Id": "parent-1",
+                    "X-Unselected": "must-not-cross-rpc",
+                },
+            ) as response:
+                assert response.status == 200
+
+    assert len(received_requests) == 1
+    params = received_requests[0]
+    assert params["json_data"] == {
+        "model": "inspect",
+        "messages": [{"role": "user", "content": "hi"}],
+        "parallel_tool_calls": False,
+    }
+    assert params["metadata_headers"] == {
+        "x-opencode-session": "session-1",
+        "x-parent-session-id": "parent-1",
+    }
+    assert params["headers"]["authorization"] == "Bearer must-not-cross-rpc"
+    assert params["headers"]["cookie"] == "must-not-cross-rpc"
+    assert params["headers"]["x-unselected"] == "must-not-cross-rpc"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "method", "forwards_client_headers"),
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "inspect", "messages": []},
+            "generate_completions",
+            True,
+        ),
+        (
+            "/v1/responses",
+            {"model": "inspect", "input": []},
+            "generate_responses",
+            True,
+        ),
+        (
+            "/v1/messages",
+            {"model": "inspect", "messages": []},
+            "generate_anthropic",
+            True,
+        ),
+        (
+            "/v1beta/models/inspect:generateContent",
+            {"contents": []},
+            "generate_google",
+            False,
+        ),
+    ],
+)
+async def test_model_proxy_routes_metadata_separately_for_each_dialect(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, Any],
+    method: str,
+    forwards_client_headers: bool,
+) -> None:
+    """Configured attribution metadata has a dedicated RPC parameter."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode-session")
+    received_requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def mock_service(received_method: str, **params: Any) -> dict[str, Any]:
+        received_requests.append((received_method, params))
+        return {}
+
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}{path}",
+                json=body,
+                headers={"X-OpenCode-Session": "native-session"},
+            ) as response:
+                assert response.status == 200
+
+    assert len(received_requests) == 1
+    received_method, params = received_requests[0]
+    assert received_method == method
+    assert params["metadata_headers"] == {"x-opencode-session": "native-session"}
+    if forwards_client_headers:
+        assert params["headers"]["x-opencode-session"] == "native-session"
+    else:
+        assert "headers" not in params
+
+
+@pytest.mark.asyncio
+async def test_model_proxy_rejects_non_token_event_metadata_header_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proxy configuration cannot use field names that change when serialized."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode session")
+
+    with pytest.raises(ValueError, match="valid HTTP token"):
+        await model_proxy_server(port=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ("authorization", "x-password"))
+async def test_model_proxy_rejects_sensitive_event_metadata_header_names(
+    monkeypatch: pytest.MonkeyPatch, header: str
+) -> None:
+    """Proxy configuration cannot expose authentication material in events."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", header)
+
+    with pytest.raises(ValueError, match="sensitive"):
+        await model_proxy_server(port=0)
+
+
+def _error_service(
+    status: int | None,
+    message: str,
+    body: dict[str, Any] | None = None,
+) -> Any:
+    """A mock bridge service that always returns a forwarded provider error."""
+    payload: dict[str, Any] = {"status": status, "message": message}
+    if body is not None:
+        payload["body"] = body
+
+    async def mock_service(method: str, **params: Any) -> dict[str, Any]:
+        return {PROVIDER_ERROR_KEY: payload}
 
     return mock_service
 
@@ -2735,6 +2990,53 @@ async def test_provider_error_forwarded_non_streaming(
             async with session.post(f"{base_url}{path}", json=body) as response:
                 assert response.status == status
                 assert assert_body(await response.json())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "request_body"),
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "gpt-5.6", "messages": [{"role": "user", "content": "hi"}]},
+        ),
+        ("/v1/responses", {"model": "gpt-5.6", "input": "hi"}),
+    ],
+)
+async def test_openai_retry_error_forwards_provider_envelope(
+    path: str, request_body: dict[str, Any]
+) -> None:
+    """Codex receives the original insufficient_quota body, not a RetryError repr."""
+    from tenacity import Future, RetryError
+
+    message = "You have no credits remaining..."
+    body = {
+        "message": message,
+        "type": "insufficient_quota",
+        "code": "credit_balance_exhausted",
+    }
+    provider_error = RateLimitError(
+        message=message,
+        response=httpx2.Response(
+            429,
+            request=httpx2.Request("POST", "https://api.openai.com/v1/responses"),
+        ),
+        body=body,
+    )
+    attempt = Future(1)
+    attempt.set_exception(provider_error)
+    retry_error = RetryError(attempt)
+    error = retry_error.last_attempt.exception()
+    assert isinstance(error, RateLimitError)
+    assert isinstance(error.body, dict)
+
+    async with _proxy_with_service(
+        _error_service(429, str(retry_error), error.body)
+    ) as base_url:
+        async with ClientSession() as session:
+            async with session.post(f"{base_url}{path}", json=request_body) as response:
+                assert response.status == 429
+                assert await response.json() == {"error": body}
 
 
 @pytest.mark.asyncio
@@ -2808,6 +3110,60 @@ async def test_proxy_survives_provider_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_streaming_preserves_completed_message_identity_after_keepalive() -> (
+    None
+):
+    """Stream identity matches the completed bridge response after keepalives."""
+    completion = {
+        "id": "native-completion-id",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-returned-model",
+        "content": [{"type": "text", "text": "completed"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+    async def mock_service(method: str, **params: Any) -> dict[str, Any]:
+        assert method == "generate_anthropic"
+        if params["json_data"].get("stream"):
+            await asyncio.sleep(5.1)
+        return completion
+
+    body = {
+        "model": "claude-requested-model",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/messages", json={**body, "stream": True}
+            ) as response:
+                assert response.status == 200
+                assert response.headers["Connection"] == "close"
+                raw_events = [
+                    json.loads(event.partition("\ndata: ")[2])
+                    for event in (await response.text()).split("\n\n")
+                    if event
+                ]
+
+            async with session.post(f"{base_url}/v1/messages", json=body) as response:
+                assert response.status == 200
+                non_streaming = await response.json()
+
+    assert raw_events[0] == {"type": "ping"}
+    message_start = next(
+        event for event in raw_events if event["type"] == "message_start"
+    )
+    assert message_start["message"]["id"] == "native-completion-id"
+    assert message_start["message"]["model"] == "claude-returned-model"
+    assert non_streaming["id"] == message_start["message"]["id"]
+    assert non_streaming["model"] == message_start["message"]["model"]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_streaming_provider_error_emits_sse_error() -> None:
     """The Anthropic streaming path forwards the error as an SSE error event."""
     body = {
@@ -2821,7 +3177,7 @@ async def test_anthropic_streaming_provider_error_emits_sse_error() -> None:
             async with session.post(f"{base_url}/v1/messages", json=body) as response:
                 assert response.status == 200
                 text = await response.text()
-    assert "event: message_start" in text
+    assert "event: message_start" not in text
     assert "event: error" in text
     assert "rate_limit_error" in text
     assert "overloaded" in text

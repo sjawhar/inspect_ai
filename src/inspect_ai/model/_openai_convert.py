@@ -131,4 +131,5 @@ async def model_output_from_openai_responses(
         model=response.model,
         choices=choices,
         usage=model_usage_from_response(response),
+        provider_response_id=response.id or None,
     )

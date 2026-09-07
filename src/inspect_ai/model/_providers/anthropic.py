@@ -1138,6 +1138,24 @@ class AnthropicAPI(ModelAPI):
             # pass through context_management for compaction
             if CONTEXT_MANAGEMENT in config.extra_body:
                 extra_body[CONTEXT_MANAGEMENT] = config.extra_body[CONTEXT_MANAGEMENT]
+            # Pass through a caller-supplied `fallbacks` directive verbatim (the
+            # agent bridge forwards Claude Code's own server-side fallback
+            # request this way). `config.fallback_models` above already wrote
+            # this key, so an explicit Inspect-level setting wins; otherwise the
+            # client's directive is honoured untouched. The beta is appended here
+            # rather than relying on the caller's `anthropic-beta` header, so the
+            # directive cannot be silently ignored by the API. Skipped on
+            # bedrock/vertex/azure, which do not accept the field at all (the same
+            # endpoints `fallback_models` warns about above) -- forwarding it
+            # there would fail the request rather than degrade gracefully.
+            if (
+                FALLBACKS_FIELD in config.extra_body
+                and FALLBACKS_FIELD not in extra_body
+                and not (self.is_bedrock() or self.is_vertex() or self.is_azure())
+            ):
+                extra_body[FALLBACKS_FIELD] = config.extra_body[FALLBACKS_FIELD]
+                if FALLBACK_BETA not in betas:
+                    betas.append(FALLBACK_BETA)
 
         # return config
         return params, extra_body, headers, betas
@@ -3489,15 +3507,14 @@ async def model_output_from_message(
                     )
 
     # cache-diagnostics: tag the assistant message with the upstream id so a
-    # subsequent turn can pass it as `diagnostics.previous_message_id`.
-    # The `diagnostics` response field itself is captured below onto the
-    # ModelOutput metadata, not the assistant message. Only when the beta
-    # is on.
+    # subsequent turn can pass it as `diagnostics.previous_message_id`. Gated
+    # on the beta because the tag changes what the next request sends; the id
+    # itself is always recorded on `ModelOutput.provider_response_id` below.
+    # The `diagnostics` response field is captured onto the ModelOutput
+    # metadata, not the assistant message.
     asst_metadata: dict[str, Any] = {}
-    if cache_diagnostics:
-        msg_id = getattr(message, "id", None)
-        if msg_id:
-            asst_metadata["message_id"] = msg_id
+    if cache_diagnostics and message.id:
+        asst_metadata["message_id"] = message.id
 
     # server-side refusal fallback: collect handoffs (in content order) so we
     # can surface the serving model and a structured metadata entry. on a
@@ -3655,6 +3672,7 @@ async def model_output_from_message(
             ),
             fallback=fallback,
             metadata=metadata,
+            provider_response_id=message.id,
         ),
         pause_turn,
     )
@@ -4055,6 +4073,9 @@ EXTRA_BODY = "extra_body"
 CONTEXT_MANAGEMENT = "context_management"
 MIN_COMPACTION_TOKENS = 50000  # Anthropic API minimum trigger value
 FALLBACK_BETA = "server-side-fallback-2026-06-01"
+# Request-body field carrying a server-side refusal fallback directive. Routed
+# via extra_body because the SDK only exposes it on client.beta.messages.create.
+FALLBACKS_FIELD = "fallbacks"
 
 
 def _add_edit_compaction(

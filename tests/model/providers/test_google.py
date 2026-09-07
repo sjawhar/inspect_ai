@@ -15,6 +15,7 @@ from google.genai.types import (
     FinishReason,
     FunctionCall,
     FunctionCallingConfigMode,
+    GenerateContentConfig,
     GenerateContentResponse,
     HttpOptions,
     JobState,
@@ -1889,22 +1890,15 @@ async def test_google_oauth_count_tokens_headers() -> None:
     assert headers["x-goog-user-project"] == "proj"
 
 
-def test_google_oauth_headers_survive_real_client() -> None:
-    """Contract test against the real google-genai client (no mocking).
-
-    The OAuth approach relies on undocumented SDK behavior: the dev-endpoint
-    client accepts a placeholder api_key, and `patch_http_options` merges
-    caller-supplied headers with caller precedence, so `Authorization` survives
-    alongside the SDK-set `x-goog-api-key`. Guards against a google-genai
-    release changing that merge.
-    """
+def test_google_oauth_real_client_excludes_placeholder_api_key() -> None:
+    """OAuth requests must not send the SDK's required placeholder as an API key."""
     api = _adc_api(_FakeCreds(token="tok-real"), quota_project_id="proj-real")
     client = api.model_client(api._http_options())
     headers = client._api_client._http_options.headers
     assert headers is not None
     assert headers["Authorization"] == "Bearer tok-real"
     assert headers["x-goog-user-project"] == "proj-real"
-    assert headers["x-goog-api-key"] == OAUTH_PLACEHOLDER_API_KEY
+    assert "x-goog-api-key" not in headers
 
 
 def test_google_use_adc_rejected_on_vertex() -> None:
@@ -1925,3 +1919,238 @@ def test_google_credentials_arg_rejected() -> None:
             api_key=None,
             credentials=object(),
         )
+
+
+def test_model_client_reuses_one_ssl_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated client construction must not rebuild the SSL context.
+
+    `Client()` is built per generate() call, and genai otherwise creates a default
+    context from the CA bundle for each one — a synchronous disk read on the event
+    loop, three times per client. Under high sandbox concurrency that blocking work
+    starves the sandbox-service RPC consumer.
+    """
+    import ssl as ssl_module
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    calls = 0
+    real = ssl_module.create_default_context
+
+    def counting(*args: Any, **kwargs: Any) -> ssl_module.SSLContext:
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ssl_module, "create_default_context", counting)
+    monkeypatch.setattr("google.genai._api_client.ssl.create_default_context", counting)
+
+    api = GoogleGenAIAPI(
+        model_name="gemini-2.0-flash",
+        base_url=None,
+        api_key="x" * 20,
+    )
+    GoogleGenAIAPI._ssl_context.cache_clear()
+    for _ in range(5):
+        api.model_client()
+
+    # one build for the whole process, not three per client
+    assert calls <= 1, f"rebuilt the SSL context {calls} times across 5 clients"
+
+
+def test_model_client_reuses_ssl_context_with_client_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bridge path passes `client_args`, which changed which dict genai reads.
+
+    genai resolves the context with a conditional that, when `client_args` is
+    non-empty, never consults `async_client_args` (google/genai/_api_client.py:
+    `args.get(verify) if args else None or async_args.get(verify) ...` parses as
+    `args.get(v) if args else ((None or async_args.get(v)) if async_args else
+    None)`). Seeding only the async dict therefore missed and genai rebuilt the
+    context ON the event loop — caught by py-spy on a live run as
+    create_default_context under bridge_generate.
+    """
+    import ssl as ssl_module
+
+    from google.genai.types import HttpOptions
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    calls = 0
+    real = ssl_module.create_default_context
+
+    def counting(*args: Any, **kwargs: Any) -> ssl_module.SSLContext:
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ssl_module, "create_default_context", counting)
+    monkeypatch.setattr("google.genai._api_client.ssl.create_default_context", counting)
+
+    api = GoogleGenAIAPI(
+        model_name="gemini-2.0-flash",
+        base_url=None,
+        api_key="x" * 20,
+    )
+    GoogleGenAIAPI._ssl_context.cache_clear()
+    for _ in range(5):
+        api.model_client(HttpOptions(client_args={"timeout": 30.0}))
+
+    assert calls <= 1, (
+        f"rebuilt the SSL context {calls} times across 5 clients with client_args"
+    )
+
+
+def test_model_client_preserves_custom_verify_for_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied CA/SSLContext on `client_args` must reach async requests too.
+
+    genai's SSL-context resolution (`_ensure_httpx_ssl_ctx`) only consults
+    `async_client_args` when `client_args` is non-empty, so pre-seeding
+    `async_client_args` with the shared default before genai runs would silently
+    override a caller-supplied custom verify for async requests while sync
+    requests stayed correctly validated against it.
+    """
+    import ssl as ssl_module
+    from typing import Any
+
+    from google.genai._api_client import AsyncHttpxClient
+    from google.genai.types import HttpOptions
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    custom_context = ssl_module.create_default_context()
+
+    captured: dict[str, Any] = {}
+    real_init = AsyncHttpxClient.__init__
+
+    def capturing_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(AsyncHttpxClient, "__init__", capturing_init)
+
+    api = GoogleGenAIAPI(
+        model_name="gemini-2.0-flash",
+        base_url=None,
+        api_key="x" * 20,
+    )
+    GoogleGenAIAPI._ssl_context.cache_clear()
+    api.model_client(HttpOptions(client_args={"verify": custom_context}))
+
+    assert captured["verify"] is custom_context, (
+        "async httpx client did not receive the caller-supplied custom verify"
+    )
+
+
+def test_model_client_converts_str_verify_for_aiohttp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied CA-bundle *path* must not reach aiohttp's `ssl` param.
+
+    httpx's `verify` legally accepts a CA-bundle path (the PR's stated contract, e.g.
+    `certifi.where()`), but aiohttp's `ssl` param only accepts
+    `SSLContext | bool | Fingerprint | None` — `aiohttp.client_reqrep` raises
+    `TypeError` on a bare path, so every aiohttp/websocket request would fail before
+    sending unless the path is converted into a context first.
+    """
+    import ssl as ssl_module
+
+    import certifi
+    from google.genai._api_client import AsyncHttpxClient
+    from google.genai.types import HttpOptions
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    ca_path = str(certifi.where())
+
+    captured: dict[str, Any] = {}
+    real_init = AsyncHttpxClient.__init__
+
+    def capturing_init(self: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(AsyncHttpxClient, "__init__", capturing_init)
+
+    api = GoogleGenAIAPI(
+        model_name="gemini-2.0-flash",
+        base_url=None,
+        api_key="x" * 20,
+    )
+    GoogleGenAIAPI._ssl_context.cache_clear()
+    GoogleGenAIAPI._ssl_context_for_path.cache_clear()
+    client = api.model_client(HttpOptions(client_args={"verify": ca_path}))
+
+    # httpx's async client keeps the original path -- that's a legal httpx `verify`.
+    assert captured["verify"] == ca_path
+
+    # aiohttp's `ssl` param only accepts SSLContext | bool | Fingerprint | None; the
+    # resolved verify value must be converted, not copied verbatim.
+    aiohttp_args = client._api_client._async_client_session_request_args
+    assert isinstance(aiohttp_args["ssl"], ssl_module.SSLContext), (
+        f"aiohttp 'ssl' arg was {aiohttp_args['ssl']!r}, not an SSLContext"
+    )
+
+
+def test_model_client_preserves_verify_false_for_aiohttp() -> None:
+    """`verify=False` must reach aiohttp as `ssl=False` unchanged, not converted."""
+    from google.genai.types import HttpOptions
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    api = GoogleGenAIAPI(
+        model_name="gemini-2.0-flash",
+        base_url=None,
+        api_key="x" * 20,
+    )
+    GoogleGenAIAPI._ssl_context.cache_clear()
+    client = api.model_client(HttpOptions(client_args={"verify": False}))
+
+    assert client._api_client._async_client_session_request_args["ssl"] is False
+
+
+@pytest.mark.anyio
+async def test_google_stream_keeps_response_id() -> None:
+    """The accumulated streaming response carries the provider's response_id.
+
+    The id is optional on each chunk; the final chunk here omits it, so the
+    accumulator must keep the first one seen rather than read the last chunk.
+    """
+
+    async def chunks():
+        yield GenerateContentResponse(
+            response_id="google-stream-123",
+            candidates=[
+                Candidate(
+                    index=0, content=Content(role="model", parts=[Part(text="Hel")])
+                )
+            ],
+        )
+        yield GenerateContentResponse(
+            candidates=[
+                Candidate(
+                    index=0,
+                    content=Content(role="model", parts=[Part(text="lo")]),
+                    finish_reason=FinishReason.STOP,
+                )
+            ],
+            model_version="gemini-2.0-flash",
+        )
+
+    mock_client = _create_mock_google_client(AsyncMock())
+    mock_client.aio.models.generate_content_stream = AsyncMock(return_value=chunks())
+    with patch("inspect_ai.model._providers.google.Client", return_value=mock_client):
+        api = GoogleGenAIAPI(
+            model_name="gemini-2.0-flash", base_url=None, api_key="test-key"
+        )
+        response = await api._stream_generate_content(
+            mock_client, "gemini-2.0-flash", [], GenerateContentConfig()
+        )
+
+    assert response.response_id == "google-stream-123"
+    assert response.candidates is not None
+    assert response.candidates[0].content is not None
+    assert response.candidates[0].content.parts is not None
+    assert response.candidates[0].content.parts[0].text == "Hello"

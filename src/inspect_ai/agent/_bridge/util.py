@@ -26,7 +26,7 @@ from inspect_ai.agent._bridge._approval import (
     apply_bridge_tool_approval,
     terminate_for_repeated_rejections,
 )
-from inspect_ai.agent._bridge._errors import BridgePolicyError
+from inspect_ai.agent._bridge._errors import BridgePolicyError, ResponseFilterError
 from inspect_ai.agent._bridge.types import AgentBridge, message_json_hash
 from inspect_ai.model._agent_message import validate_agent_message
 from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
@@ -36,14 +36,19 @@ from inspect_ai.model._generate_config import (
     active_generate_config,
 )
 from inspect_ai.model._model import (
+    BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
+    BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
     Model,
     ModelGenerateFilter,
     ModelName,
+    ModelResolver,
     active_model,
     get_model,
     model_roles,
+    use_model_event_metadata,
     use_model_event_sink,
 )
 from inspect_ai.model._model_output import ModelOutput
@@ -438,6 +443,60 @@ def _restore_operator_message_source(
         bridge._pending_operator = 0
 
 
+def _record_filter_answered_interaction(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+    output: ModelOutput,
+) -> None:
+    """Record a ModelEvent for output a bridge filter produced without generating.
+
+    The event carries the real ``ModelOutput`` the scaffold consumes, so a
+    transcript consumer can trace the resulting assistant message back to it by
+    content. ``call`` stays ``None`` (no provider request was made) and
+    ``BRIDGE_FILTER_SYNTHETIC`` marks the event, so a consumer counting real
+    provider round-trips can exclude it.
+    """
+    tool_info = [
+        tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+        for tool in tools
+    ]
+    with (
+        use_model_event_sink(bridge.model_event_sink),
+        use_model_event_metadata({BRIDGE_FILTER_SYNTHETIC: True}),
+    ):
+        # _record_model_interaction self-completes when given output (it ends
+        # with `if output: complete(output, call)`), so no explicit complete()
+        # here -- a second call would forward the event through the sink twice.
+        _ = model._record_model_interaction(  # pyright: ignore[reportPrivateUsage]  # bridge is in-package; no public recorder exists
+            input=input,
+            tools=tool_info,
+            tool_choice=tool_choice if tool_choice is not None else "auto",
+            config=config,
+            cache=None,
+            output=output,
+            call=None,
+        )
+
+
+def _bridge_request_metadata(
+    bridge: AgentBridge, metadata_headers: dict[str, str] | None
+) -> dict[str, dict[str, str]]:
+    """Select configured non-sensitive request headers for event metadata."""
+    if not bridge.model_event_metadata_headers or metadata_headers is None:
+        return {}
+
+    selected = {
+        name: metadata_headers[name]
+        for name in bridge.model_event_metadata_headers
+        if name in metadata_headers
+    }
+    return {BRIDGE_REQUEST_HEADERS: selected} if selected else {}
+
+
 async def bridge_generate(
     bridge: AgentBridge,
     model: Model,
@@ -445,6 +504,9 @@ async def bridge_generate(
     tools: Sequence[ToolInfo | Tool],
     tool_choice: ToolChoice | None,
     config: GenerateConfig,
+    metadata_headers: dict[str, str] | None = None,
+    requested_model: str | None = None,
+    codex_thread_metadata: dict[str, str] | None = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     """Generate model output through the agent bridge.
 
@@ -459,6 +521,29 @@ async def bridge_generate(
     rejected and generation is retried, so the scaffold sees only the replacement (see
     `_approval.apply_bridge_tool_approval`).
     """
+    # Stamp the client-requested model and configured request metadata onto every
+    # ModelEvent emitted below. `model` here is the RESOLVED Inspect model: alias
+    # resolution may have mapped the requested name onto a different one (e.g.
+    # codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
+    # and without this the requested name never reaches the transcript -- so a
+    # reviewer turn is indistinguishable from the agent's own.
+    metadata: dict[str, Any] = _bridge_request_metadata(bridge, metadata_headers)
+    if requested_model:
+        metadata[BRIDGE_REQUESTED_MODEL] = requested_model
+    if codex_thread_metadata is not None:
+        metadata["agent_bridge"] = {"codex": codex_thread_metadata}
+    with use_model_event_metadata(metadata):
+        return await _bridge_generate(bridge, model, input, tools, tool_choice, config)
+
+
+async def _bridge_generate(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+) -> tuple[ModelOutput, ChatMessageUser | None]:
     # restore operator provenance lost to a bridged scaffold's round-trip (e.g.
     # claude_code re-emits an operator message as a plain user message). Done
     # before compaction/recording so the restored source persists in both the
@@ -525,11 +610,55 @@ async def bridge_generate(
                     tools=tools,
                     config=config,
                 )
+        else:
+            # The filter answered instead of the provider, so `generate()` never
+            # ran and recorded nothing. Record the interaction anyway: the
+            # scaffold consumes this output, so a grader reading the transcript
+            # otherwise sees an assistant message that no ModelEvent accounts
+            # for -- indistinguishable from a message the agent never produced,
+            # or from a foreign injection. `call=None` plus the
+            # BRIDGE_FILTER_SYNTHETIC metadata flag distinguish it from a real
+            # provider round-trip.
+            _record_filter_answered_interaction(
+                bridge, model, input_messages, tools, tool_choice, config, output
+            )
 
-        # Update the compaction baseline with the actual input token
-        # count from the generate call (most accurate source of truth)
+        # Update the compaction baseline with the actual input token count
+        # from the generate call (most accurate source of truth). This must
+        # happen before the response filter runs: a replacing filter changes
+        # what the scaffold sees, not what the call actually consumed, and a
+        # synthetic replacement (e.g. `ModelOutput.from_content()`) carries no
+        # usage at all, which would silently stall calibration on the
+        # count_tokens estimate for the rest of the run.
         if compact is not None:
             await compact.record_output(input_messages, output)
+
+        # Apply response filter if configured.
+        # Runs inside the refusal-retry loop so a filter that returns a
+        # content_filter ModelOutput triggers a retry; the input arguments
+        # passed are the same ones sent to model.generate() (post-request-filter
+        # mutation if applicable). A response_filter is eval logic, not a
+        # passive observer, so a failure in it fails the sample (attributed
+        # to the filter) instead of being reported to the scaffold as a
+        # model/provider error; see `ResponseFilterError`.
+        if bridge.response_filter is not None:
+            tool_info_for_response = [
+                tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                for tool in tools
+            ]
+            try:
+                filtered = await bridge.response_filter(
+                    model,
+                    output,
+                    input_messages,
+                    tool_info_for_response,
+                    tool_choice,
+                    config,
+                )
+            except Exception as ex:
+                raise ResponseFilterError(str(ex)) from ex
+            if filtered is not None:
+                output = filtered
 
         # Check for refusal and retry if needed
         if (
@@ -579,13 +708,44 @@ def resolve_inspect_model(
     model_name: str,
     model_aliases: dict[str, str | Model] | None = None,
     fallback_model: str | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    provider: str = "",
 ) -> Model:
     if model_aliases and model_name in model_aliases:
         return get_model(model_aliases[model_name])
 
+    # The client's original request, before provider qualification below widens a
+    # bare name (e.g. "gpt-4o" -> "openai/gpt-4o"). Kept so the active-model match
+    # at the end can still recognize a bare name that matches the active model's
+    # short name even after qualification changes `model_name`.
+    raw_model_name = model_name
+
+    # A bare model name on a provider-specific bridge endpoint resolves to that provider (the
+    # endpoint implies it); otherwise get_model rejects the unqualified name.
+    if (
+        provider
+        and "/" not in model_name
+        and model_name != "inspect"
+        and model_name not in model_roles()
+    ):
+        model_name = f"{provider}/{model_name}"
+
+    # Dynamic routing policy: checked after explicit aliases, before the static
+    # fallback. Returning None defers to the fallback / normal resolution below.
+    if model_resolver is not None:
+        resolved = model_resolver(model_name)
+        if resolved is not None:
+            return resolved if isinstance(resolved, Model) else get_model(resolved)
+
+    # An explicitly configured fallback overrides whatever the client asked for; it
+    # must win over the active-model match below rather than be silently shadowed
+    # by a bare name that happens to match the active model's short name.
+    fallback_applied = False
     if fallback_model is not None:
         if model_name != "inspect" or not fallback_model.startswith("inspect/"):
             model_name = fallback_model
+            fallback_applied = True
 
     if model_name == "inspect":
         return get_model()
@@ -604,10 +764,20 @@ def resolve_inspect_model(
     # options were silently dropped before the provider request. Returning the active
     # instance also avoids a second Model (and its connection pool) for one model.
     #
+    # A bare name is also matched against the raw pre-qualification request:
+    # provider qualification above widens e.g. "gpt-4o" to "openai/gpt-4o", which no
+    # longer matches an active model on a different provider (e.g. "azureai/gpt-4o")
+    # even though the client meant the eval's own model. That raw-name match is
+    # skipped once an explicit fallback has applied -- the fallback override must
+    # win, not be silently shadowed by this heuristic.
+    #
     # Deliberately placed last: aliases, an explicit "inspect", and model roles all
     # return above, so this cannot redirect a role or alias to the eval's model.
     active = active_model()
-    if active is not None and model_name in (str(active), ModelName(active).name):
+    if active is not None and (
+        model_name in (str(active), ModelName(active).name)
+        or (not fallback_applied and raw_model_name == ModelName(active).name)
+    ):
         return active
 
     return get_model(model_name)

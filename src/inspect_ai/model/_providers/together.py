@@ -331,7 +331,12 @@ class TogetherRESTAPI(ModelAPI):
             else:
                 usage = ModelUsage()
 
-            return ModelOutput(model=model, choices=choices, usage=usage)
+            return ModelOutput(
+                model=model,
+                choices=choices,
+                usage=usage,
+                provider_response_id=response.get("id") or None,
+            )
 
     @override
     def should_retry(self, ex: Exception) -> bool | RetryDecision:

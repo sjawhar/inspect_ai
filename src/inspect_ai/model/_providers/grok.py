@@ -502,8 +502,17 @@ class GrokAPI(ModelAPI):
         return super().input_tokens_name()
 
     def _handle_grpc_bad_request(self, ex: grpc.RpcError) -> ModelOutput | Exception:
+        """Map an INVALID_ARGUMENT context-overflow error to a model_length output.
+
+        xAI's wording has varied ("prompt length" historically, the structured
+        code "[input_too_large]" currently). Don't match "exceeds budget" alone:
+        xAI uses budget language for reasoning-token limits too.
+        """
         details = ex.details() or ""
-        if "prompt length" in details:
+        details_lower = details.lower()
+        if any(
+            marker in details_lower for marker in ("prompt length", "input_too_large")
+        ):
             return ModelOutput.from_content(
                 model=self.model_name, content=details, stop_reason="model_length"
             )
@@ -634,6 +643,7 @@ class GrokAPI(ModelAPI):
             choices=[self._completion_choice_from_response(response, tools)],
             completion=response.content,
             usage=_model_usage_from_sampling_usage(response.usage),
+            provider_response_id=response.id or None,
         )
 
     def _completion_choice_from_response(

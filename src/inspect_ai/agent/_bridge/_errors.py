@@ -11,7 +11,8 @@ error response.
 this module — keep the two in sync.
 """
 
-from typing_extensions import TypedDict
+from pydantic import JsonValue
+from typing_extensions import NotRequired, TypedDict
 
 from inspect_ai._util.http import status_code_of
 
@@ -33,19 +34,73 @@ class BridgePolicyError(Exception):
     status_code = 400
 
 
+class ResponseFilterError(Exception):
+    """A `response_filter` raised while transforming a model's output.
+
+    A response filter is eval logic, not a passive observer of the model
+    response, so a failure in it should propagate and fail the sample
+    (attributed to the filter) rather than being reported to the scaffold as
+    a model/provider error. Wrapping the original exception gives both the
+    sandbox path (`_forward_provider_errors` excludes this type the way it
+    excludes `LimitExceededError`) and the in-process path one exception
+    type to raise, instead of each path handling filter failures
+    differently. The original exception is preserved as `__cause__`.
+    """
+
+
 class ProviderErrorPayload(TypedDict):
     """Forwardable provider-error detail carried under `PROVIDER_ERROR_KEY`."""
 
     status: int | None
     message: str
+    body: NotRequired[JsonValue]
 
 
 def provider_error_payload(ex: Exception) -> ProviderErrorPayload:
     """Extract a forwardable provider-error payload from an exception.
 
-    Best-effort: recovers the HTTP status (from `ModelGenerateError` or a raw
-    provider SDK exception) and a clean message, degrading to `str(ex)` when no
-    structured detail is available.
+    The retry layer raises ``RetryError`` after retries exhaust. Prefer its
+    explicit cause, then its final failed attempt, so callers receive the
+    originating provider error rather than a tenacity representation.
     """
-    message = getattr(ex, "provider_message", None) or str(ex)
-    return ProviderErrorPayload(status=status_code_of(ex), message=message)
+    from tenacity import RetryError
+
+    if isinstance(ex, RetryError):
+        if isinstance(ex.__cause__, Exception):
+            ex = ex.__cause__
+        else:
+            last_attempt = getattr(ex, "last_attempt", None)
+            if last_attempt is not None and last_attempt.done():
+                attempt_error = last_attempt.exception()
+                if isinstance(attempt_error, Exception):
+                    ex = attempt_error
+
+    try:
+        message = getattr(ex, "provider_message", None) or str(ex)
+    except Exception:
+        message = type(ex).__name__
+    payload = ProviderErrorPayload(status=status_code_of(ex), message=message)
+
+    try:
+        from openai import APIStatusError
+    except ImportError:
+        return payload
+
+    provider_error: Exception | None = ex
+    while provider_error is not None:
+        if isinstance(provider_error, APIStatusError) and isinstance(
+            provider_error.body, dict
+        ):
+            body = provider_error.body
+            body_message = body.get("message")
+            if isinstance(body_message, str):
+                payload["message"] = body_message
+            payload["body"] = body
+            return payload
+        provider_error = (
+            provider_error.__cause__
+            if isinstance(provider_error.__cause__, Exception)
+            else None
+        )
+
+    return payload

@@ -19,6 +19,19 @@ def test_completion_deserialization() -> None:
     assert len(log.samples[0].output.completion) > 0
 
 
+def test_provider_response_id_absent_in_older_logs() -> None:
+    """A log written before the field existed still loads, with the id unset."""
+    log_file = (
+        Path(__file__).parent.parent
+        / "log"
+        / "test_list_logs"
+        / "2024-11-05T13-31-45-05-00_input-task_8zXjbRzCWrL9GXiXo2vus9.json"
+    )
+    log = read_eval_log(log_file)
+    assert log.samples
+    assert log.samples[0].output.provider_response_id is None
+
+
 def test_model_usage_addition() -> None:
     usage1 = ModelUsage(
         input_tokens=1,

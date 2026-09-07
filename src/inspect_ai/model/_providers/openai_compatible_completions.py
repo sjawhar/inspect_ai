@@ -164,7 +164,11 @@ async def generate_raw_completions(
 
     # Parse response
     if not response.choices:
-        return ModelOutput(model=response.model, choices=[]), model_call
+        return ModelOutput(
+            model=response.model,
+            choices=[],
+            provider_response_id=response.id or None,
+        ), model_call
 
     def parse_choice(choice: CompletionChoice) -> ChatCompletionChoice:
         # prompt_logprobs: vLLM extension (also implemented by SGLang), lives
@@ -198,6 +202,7 @@ async def generate_raw_completions(
             if response.usage
             else None
         ),
+        provider_response_id=response.id or None,
     )
 
     return model_output, model_call

@@ -280,6 +280,24 @@ class ModelOutput(BaseModel):
     metadata: dict[str, Any] | None = Field(default=None)
     """Additional metadata associated with model output."""
 
+    provider_response_id: str | None = Field(default=None)
+    """Provider's own id for the response that produced this output.
+
+    The id the provider assigns its response (Anthropic `msg_...`, OpenAI
+    `chatcmpl-...`/`resp_...`, Google's `response_id`), for correlating an eval
+    against the provider's own record of the call.
+
+    Recorded here rather than read back from `ModelEvent.call` because by
+    default the raw request/response is retained for only the first few calls
+    per model per sample (`DEFAULT_LOG_MODEL_API_CALLS`, unless `log_model_api`
+    says otherwise), so on any longer sample the id is otherwise absent from the
+    log for every later call. Where a provider call is continued (Anthropic
+    `pause_turn`) this is the id of the final response, while `ModelEvent.call`
+    records the first. `None` for synthetic outputs, for adapters that record
+    no per-response id, when the provider omits one, and for a log written
+    before this field existed.
+    """
+
     error: str | None = Field(default=None)
     """Error message in the case of content moderation refusals."""
 
