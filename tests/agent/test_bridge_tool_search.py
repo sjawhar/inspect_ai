@@ -146,6 +146,7 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
                 {"action": "screenshot"},
                 tool_call_id="browser_1",
             ),
+            ModelOutput.from_content("mockllm/model", "done"),
         ]
     )
 
@@ -170,6 +171,24 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
                 "client-discovered MCP namespace missing from the non-OpenAI "
                 "bridge continuation"
             )
+        if len(tool_names_seen) == 3:
+            replayed_calls = [
+                call
+                for message in _input
+                if isinstance(message, ChatMessageAssistant)
+                for call in message.tool_calls or []
+                if call.id == "browser_1"
+            ]
+            assert len(replayed_calls) == 1
+            assert replayed_calls[0].function == browser_tool_name
+            replayed_results = [
+                message
+                for message in _input
+                if isinstance(message, ChatMessageTool)
+                and message.tool_call_id == "browser_1"
+            ]
+            assert len(replayed_results) == 1
+            assert replayed_results[0].function == browser_tool_name
         return next(outputs)
 
     model = get_model("mockllm/model", custom_outputs=custom_outputs)
@@ -200,16 +219,16 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
     assert first_call.arguments == {"query": "browser tools", "limit": 8}
     assert first_call.execution == "client"
 
+    discovery_output = {
+        "type": "tool_search_output",
+        "call_id": first_call.call_id,
+        "tools": [discovered_mcp_namespace],
+        "status": "completed",
+    }
     continuation = [
         {"role": "user", "content": "Find a browser tool."},
         *(item.model_dump(exclude_none=True) for item in first_response.output),
-        {
-            "type": "tool_search_output",
-            "call_id": first_call.call_id,
-            "tools": [discovered_mcp_namespace],
-            "execution": "client",
-            "status": "completed",
-        },
+        discovery_output,
     ]
     second_response = await inspect_responses_api_request(
         {
@@ -223,14 +242,6 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
         bridge,
     )
 
-    assert tool_names_seen == [
-        {TOOL_SEARCH_NAME},
-        {
-            TOOL_SEARCH_NAME,
-            browser_tool_name,
-            f"{discovered_mcp_namespace['name']}__javascript_exec",
-        },
-    ]
     second_calls = [
         item
         for item in second_response.output
@@ -242,6 +253,42 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
     assert second_call.name == "browser"
     assert second_call.namespace == discovered_mcp_namespace["name"]
     assert second_call.arguments == '{"action": "screenshot"}'
+    third_response = await inspect_responses_api_request(
+        {
+            "model": "inspect",
+            "input": [
+                {"role": "user", "content": "Find a browser tool."},
+                *(item.model_dump(exclude_none=True) for item in first_response.output),
+                discovery_output,
+                *(item.model_dump(exclude_none=True) for item in second_response.output),
+                {
+                    "type": "function_call_output",
+                    "call_id": second_call.call_id,
+                    "output": "screenshot taken",
+                },
+            ],
+            "tools": [requested_tool_search],
+        },
+        None,
+        None,
+        None,
+        bridge,
+    )
+
+    assert third_response.output_text == "done"
+    assert tool_names_seen == [
+        {TOOL_SEARCH_NAME},
+        {
+            TOOL_SEARCH_NAME,
+            browser_tool_name,
+            f"{discovered_mcp_namespace['name']}__javascript_exec",
+        },
+        {
+            TOOL_SEARCH_NAME,
+            browser_tool_name,
+            f"{discovered_mcp_namespace['name']}__javascript_exec",
+        },
+    ]
 
 
 # 1. incoming tool_search param -> ToolInfo with marker + verbatim execution
