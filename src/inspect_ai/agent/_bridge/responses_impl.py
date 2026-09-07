@@ -1,6 +1,5 @@
-from collections.abc import Iterable
-
 import json
+from collections.abc import Iterable
 from logging import getLogger
 from time import time
 from typing import Any, Set, TypeGuard, cast
