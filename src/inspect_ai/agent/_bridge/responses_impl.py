@@ -224,12 +224,27 @@ async def inspect_responses_api_request_impl(
     # validate computer use compatibility
     responses_tools: list[ToolParam] = list(json_data.get("tools", []))
     client_discovered_tools: list[ToolParam] = []
+    client_tool_search_declared = any(
+        is_tool_search_tool_param(tool) and tool.get("execution") == "client"
+        for tool in responses_tools
+    )
 
     # Merge declarations that arrive as input items into the tool list used for
     # generation. A client-executed tool_search result is a declaration for the
     # next non-OpenAI generation; native OpenAI Responses models replay it
     # through their provider-specific input instead.
     input: str | list[ResponseInputItemParam] = json_data["input"]
+    client_tool_search_call_ids = (
+        {
+            item["call_id"]
+            for item in input
+            if isinstance(item, dict)
+            and is_response_tool_search_call(item)
+            and item.get("execution") == "client"
+        }
+        if isinstance(input, list)
+        else set()
+    )
     declared_tool_keys = {
         (tool.get("type"), tool.get("name")) for tool in responses_tools
     }
@@ -244,7 +259,10 @@ async def inspect_responses_api_request_impl(
             elif (
                 not is_openai
                 and is_tool_search_output(item)
-                and item.get("execution") == "client"
+                and (
+                    item.get("call_id") in client_tool_search_call_ids
+                    or client_tool_search_declared
+                )
             ):
                 item_tools = item.get("tools")
                 client_discovery_output = True
@@ -806,6 +824,7 @@ def messages_from_responses_input(
         tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
         for tool in tools
     ]
+    available_tool_names = {tool.name for tool in tools_info}
 
     messages: list[ChatMessage] = []
     function_calls_by_id: dict[str, str] = {}
@@ -940,7 +959,13 @@ def messages_from_responses_input(
                             )
 
                 elif is_response_function_tool_call(param):
-                    function_calls_by_id[param["call_id"]] = param["name"]
+                    function = param["name"]
+                    namespace = param.get("namespace")
+                    if namespace is not None:
+                        namespaced_function = f"{namespace}__{function}"
+                        if namespaced_function in available_tool_names:
+                            function = namespaced_function
+                    function_calls_by_id[param["call_id"]] = function
                     # Preserve the call's `namespace` for verbatim replay to the
                     # real model. The provider replays from assistant_internal
                     # (keyed by call_id) but only caches calls it generated this
@@ -952,7 +977,7 @@ def messages_from_responses_input(
                     tool_calls.append(
                         parse_tool_call(
                             id=param["call_id"],
-                            function=param["name"],
+                            function=function,
                             arguments=param["arguments"],
                             tools=tools_info,
                         )
