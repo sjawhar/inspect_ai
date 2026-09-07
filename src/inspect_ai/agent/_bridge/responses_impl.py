@@ -1,7 +1,9 @@
+from collections.abc import Iterable
+
 import json
 from logging import getLogger
 from time import time
-from typing import Any, Iterable, Set, cast
+from typing import Any, Set, cast
 
 from openai.types.responses import (
     Response,
@@ -222,23 +224,32 @@ async def inspect_responses_api_request_impl(
     # validate computer use compatibility
     responses_tools: list[ToolParam] = list(json_data.get("tools", []))
 
-    # some CLI agents (e.g. codex >= 0.144) declare their tools via
-    # `additional_tools` input items rather than (or in addition to) the
-    # request's top-level `tools` array. Merge those declarations into the
-    # tool list so the generate() call carries real tools -- otherwise the
-    # model receives no tools at all and cannot emit structured tool calls.
+    # Merge declarations that arrive as input items into the tool list used for
+    # generation. A client-executed tool_search result is a declaration for the
+    # next non-OpenAI generation; native OpenAI Responses models replay it
+    # through their provider-specific input instead.
     input: str | list[ResponseInputItemParam] = json_data["input"]
     declared_tool_keys = {
         (tool.get("type"), tool.get("name")) for tool in responses_tools
     }
     if isinstance(input, list):
         for item in input:
-            if isinstance(item, dict) and is_additional_tools(item):
-                for declared in item.get("tools", []) or []:
-                    key = (declared.get("type"), declared.get("name"))
-                    if key not in declared_tool_keys:
-                        declared_tool_keys.add(key)
-                        responses_tools.append(declared)
+            if not isinstance(item, dict):
+                continue
+            item_tools: Iterable[ToolParam] | None = None
+            if is_additional_tools(item):
+                item_tools = item.get("tools")
+            elif (
+                not is_openai
+                and is_tool_search_output(item)
+                and item.get("execution") == "client"
+            ):
+                item_tools = item.get("tools")
+            for declared in item_tools or []:
+                key = (declared.get("type"), declared.get("name"))
+                if key not in declared_tool_keys:
+                    declared_tool_keys.add(key)
+                    responses_tools.append(declared)
 
     has_computer_use = any(is_computer_tool_param(tool) for tool in responses_tools)
     if has_computer_use and not is_openai:
@@ -257,8 +268,14 @@ async def inspect_responses_api_request_impl(
     for tool in responses_tools:
         if not is_openai and tool["type"] == "custom":
             continue
-        # tool_search passthrough is OpenAI-Responses-only; drop for other targets
-        if not is_openai and is_tool_search_tool_param(tool):
+        # Server-executed tool_search is native to OpenAI Responses. A
+        # client-executed search is resolved by the scaffold and can be sent to
+        # any model provider.
+        if (
+            not is_openai
+            and is_tool_search_tool_param(tool)
+            and tool.get("execution") != "client"
+        ):
             continue
         if is_namespace_tool_param(tool):
             _harvest_tool_namespaces(tool, tool_namespaces)
