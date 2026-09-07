@@ -12,7 +12,6 @@ import json
 from typing import Any, cast
 
 import pytest
-
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -48,8 +47,8 @@ from inspect_ai.model._openai_responses import (
     is_tool_search_tool_param,
     maybe_tool_search_tool,
 )
-from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_call import ToolCall
+from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_info import ToolInfo
 
 WEB_SEARCH_PROVIDERS: Any = {}
@@ -129,7 +128,9 @@ def _deferred_mcp_namespace() -> dict[str, Any]:
     }
 
 
-async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools() -> None:
+async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools() -> (
+    None
+):
     """A client discovery call survives a non-OpenAI bridge continuation."""
     requested_tool_search = _tool_search_tool_param()
     discovered_mcp_namespace = _deferred_mcp_namespace()
@@ -263,7 +264,10 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
                 {"role": "user", "content": "Find a browser tool."},
                 *(item.model_dump(exclude_none=True) for item in first_response.output),
                 discovery_output,
-                *(item.model_dump(exclude_none=True) for item in second_response.output),
+                *(
+                    item.model_dump(exclude_none=True)
+                    for item in second_response.output
+                ),
                 {
                     "type": "function_call_output",
                     "call_id": second_call.call_id,
@@ -1035,7 +1039,7 @@ async def test_tool_search_output_replay_gated_on_cached_call() -> None:
 
 
 async def test_compaction_does_not_clear_tool_search() -> None:
-    from inspect_ai.model import ChatMessage, ChatMessageUser
+    from inspect_ai.model import ChatMessageUser
     from inspect_ai.model._compaction.edit import TOOL_RESULT_REMOVED, CompactionEdit
     from inspect_ai.model._model import get_model
 
