@@ -90,25 +90,47 @@ def _discoverable_function_tool() -> dict[str, Any]:
     }
 
 
-def _deferred_mcp_tool() -> dict[str, Any]:
+def _deferred_mcp_namespace() -> dict[str, Any]:
     return {
-        "type": "function",
-        "name": "mcp__agent_c_mcp__browser",
-        "description": "Control the task browser through agent-c-mcp.",
-        "parameters": {
-            "type": "object",
-            "properties": {"action": {"type": "string"}},
-            "required": ["action"],
-            "additionalProperties": False,
-        },
-        "strict": False,
+        "type": "namespace",
+        "name": "mcp__agent_c_mcp",
+        "description": "Deferred agent-c-mcp browser tools.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "browser",
+                "description": "Control the task browser through agent-c-mcp.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"action": {"type": "string"}},
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+                "strict": False,
+                "defer_loading": True,
+            },
+            {
+                "type": "function",
+                "name": "javascript_exec",
+                "description": "Run JavaScript in the task browser.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"script": {"type": "string"}},
+                    "required": ["script"],
+                    "additionalProperties": False,
+                },
+                "strict": False,
+                "defer_loading": True,
+            },
+        ],
     }
 
 
 async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools() -> None:
     """A client discovery call survives a non-OpenAI bridge continuation."""
     requested_tool_search = _tool_search_tool_param()
-    discovered_mcp_tool = _deferred_mcp_tool()
+    discovered_mcp_namespace = _deferred_mcp_namespace()
+    browser_tool_name = f"{discovered_mcp_namespace['name']}__browser"
     tool_names_seen: list[set[str]] = []
     outputs = iter(
         [
@@ -120,7 +142,7 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
             ),
             ModelOutput.for_tool_call(
                 "mockllm/model",
-                discovered_mcp_tool["name"],
+                browser_tool_name,
                 {"action": "screenshot"},
                 tool_call_id="browser_1",
             ),
@@ -140,8 +162,12 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
                 "client tool_search missing from the first non-OpenAI bridge generation"
             )
         else:
-            assert names == {TOOL_SEARCH_NAME, discovered_mcp_tool["name"]}, (
-                "client-discovered MCP declarations missing from the non-OpenAI "
+            assert names == {
+                TOOL_SEARCH_NAME,
+                browser_tool_name,
+                f"{discovered_mcp_namespace['name']}__javascript_exec",
+            }, (
+                "client-discovered MCP namespace missing from the non-OpenAI "
                 "bridge continuation"
             )
         return next(outputs)
@@ -180,7 +206,7 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
         {
             "type": "tool_search_output",
             "call_id": first_call.call_id,
-            "tools": [discovered_mcp_tool],
+            "tools": [discovered_mcp_namespace],
             "execution": "client",
             "status": "completed",
         },
@@ -199,7 +225,11 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
 
     assert tool_names_seen == [
         {TOOL_SEARCH_NAME},
-        {TOOL_SEARCH_NAME, discovered_mcp_tool["name"]},
+        {
+            TOOL_SEARCH_NAME,
+            browser_tool_name,
+            f"{discovered_mcp_namespace['name']}__javascript_exec",
+        },
     ]
     second_calls = [
         item
@@ -208,7 +238,9 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
     ]
     assert len(second_calls) == 1
     second_call = second_calls[0]
-    assert second_call.name == discovered_mcp_tool["name"]
+    assert second_call.call_id == "browser_1"
+    assert second_call.name == "browser"
+    assert second_call.namespace == discovered_mcp_namespace["name"]
     assert second_call.arguments == '{"action": "screenshot"}'
 
 
