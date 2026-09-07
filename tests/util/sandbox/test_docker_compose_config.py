@@ -226,9 +226,7 @@ async def test_retained_project_preserves_config_until_exact_cleanup(
             ),
         ]
 
-    async def fake_compose_down(
-        cleanup_project: ComposeProject, _quiet: bool
-    ) -> None:
+    async def fake_compose_down(cleanup_project: ComposeProject, _quiet: bool) -> None:
         assert cleanup_project.config is not None
         compose_down_configs.append(
             Path(cleanup_project.config).read_text(encoding="utf-8")
@@ -276,9 +274,7 @@ async def test_full_cleanup_removes_auto_compose_config(
         env=None,
     )
 
-    async def fake_compose_down(
-        cleanup_project: ComposeProject, _quiet: bool
-    ) -> None:
+    async def fake_compose_down(cleanup_project: ComposeProject, _quiet: bool) -> None:
         assert cleanup_project == project
 
     monkeypatch.setattr(cleanup_module, "auto_compose_dir", lambda: tmp_path)
