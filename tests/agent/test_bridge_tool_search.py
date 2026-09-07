@@ -11,7 +11,11 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-from openai.types.responses import ResponseInputItemParam, ToolParam
+from openai.types.responses import (
+    ResponseInputItemParam,
+    ToolParam,
+    ToolSearchToolParam,
+)
 
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.agent._bridge.responses import inspect_responses_api_request
@@ -47,30 +51,27 @@ WEB_SEARCH_PROVIDERS: Any = {}
 CODE_EXECUTION_PROVIDERS: Any = {}
 
 
-def _tool_search_tool_param() -> ToolParam:
-    return cast(
-        ToolParam,
-        {
-            "type": "tool_search",
-            "description": "Search for available tools",
-            "execution": "client",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "number",
-                        "description": "Maximum number of tools to return. Defaults to 8.",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search query for deferred tools.",
-                    },
+def _tool_search_tool_param() -> ToolSearchToolParam:
+    return {
+        "type": "tool_search",
+        "description": "Search for available tools",
+        "execution": "client",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of tools to return. Defaults to 8.",
                 },
-                "required": ["query"],
-                "additionalProperties": False,
+                "query": {
+                    "type": "string",
+                    "description": "Search query for deferred tools.",
+                },
             },
+            "required": ["query"],
+            "additionalProperties": False,
         },
-    )
+    }
 
 
 def _discoverable_function_tool() -> dict[str, Any]:
