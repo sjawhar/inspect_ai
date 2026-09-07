@@ -12,7 +12,9 @@ import json
 from typing import Any, cast
 
 from openai.types.responses import (
+    ResponseFunctionToolCall,
     ResponseInputItemParam,
+    ResponseToolSearchCall,
     ToolParam,
     ToolSearchToolParam,
 )
@@ -161,16 +163,20 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
         bridge,
     )
 
-    assert len(first_response.output) == 1
-    first_call = first_response.output[0]
-    assert first_call.type == "tool_search_call"
+    first_calls = [
+        item
+        for item in first_response.output
+        if isinstance(item, ResponseToolSearchCall)
+    ]
+    assert len(first_calls) == 1
+    first_call = first_calls[0]
     assert first_call.call_id == "tool_search_1"
     assert first_call.arguments == {"query": "browser tools", "limit": 8}
     assert first_call.execution == "client"
 
     continuation = [
         {"role": "user", "content": "Find a browser tool."},
-        first_call.model_dump(exclude_none=True),
+        *(item.model_dump(exclude_none=True) for item in first_response.output),
         {
             "type": "tool_search_output",
             "call_id": first_call.call_id,
@@ -195,9 +201,13 @@ async def test_client_tool_search_reaches_non_openai_with_discovered_mcp_tools()
         {TOOL_SEARCH_NAME},
         {TOOL_SEARCH_NAME, discovered_mcp_tool["name"]},
     ]
-    assert len(second_response.output) == 1
-    second_call = second_response.output[0]
-    assert second_call.type == "function_call"
+    second_calls = [
+        item
+        for item in second_response.output
+        if isinstance(item, ResponseFunctionToolCall)
+    ]
+    assert len(second_calls) == 1
+    second_call = second_calls[0]
     assert second_call.name == discovered_mcp_tool["name"]
     assert second_call.arguments == '{"action": "screenshot"}'
 
