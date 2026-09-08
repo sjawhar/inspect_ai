@@ -7,7 +7,9 @@ size limits (fzstd @ 256 MiB) can decode large inspect_ai .eval files.
 
 from __future__ import annotations
 
+import hashlib
 import random
+import tracemalloc
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -248,3 +250,63 @@ def test_legacy_single_arg_decompress_returns_everything(
     assert decompressor.decompress(compressed) == payload
     assert decompressor.needs_input is True
     assert decompressor.eof is False
+
+
+def test_post_gh156002_bounded_read_of_real_multiframe_zip_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounded ZIP reads do not materialize an entire compressed member."""
+    monkeypatch.setattr(
+        inspect_ai._util.zipfile, "_MAX_INPUT_PER_FRAME", 2 * 1024 * 1024
+    )
+    payload = b"x" * (8 * 1024 * 1024)
+    zip_path = tmp_path / "bounded.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=ZIP_ZSTANDARD) as zf:
+        zf.writestr("entry.bin", payload)
+
+    compressed = read_raw_compressed_entry(zip_path, "entry.bin")
+    assert compressed.count(ZSTD_MAGIC) == 4
+    zip_ext_file: Any = zipfile.ZipExtFile
+    original_read1 = zip_ext_file._read1
+    calls = 0
+
+    def read1_after_gh156002(fp: Any, n: int) -> bytes:
+        """Run the patched CPython path for a zstd member in a real ZipExtFile."""
+        nonlocal calls
+        if fp._compress_type != ZIP_ZSTANDARD:
+            return original_read1(fp, n)
+        if fp._eof or n <= 0:
+            return b""
+
+        calls += 1
+        assert calls <= len(payload) // MIN_READ_SIZE + len(compressed) + 10
+        decompressor = fp._decompressor
+        data = fp._read2(n) if decompressor.needs_input else b""
+        n = max(n, fp.MIN_READ_SIZE)
+        data = decompressor.decompress(data, n)
+        fp._eof = decompressor.eof or (
+            fp._compress_left <= 0 and decompressor.needs_input
+        )
+        data = data[: fp._left]
+        fp._left -= len(data)
+        if fp._left <= 0:
+            fp._eof = True
+        fp._update_crc(data)
+        return data
+
+    monkeypatch.setattr(zip_ext_file, "_read1", read1_after_gh156002)
+    expected_digest = hashlib.sha256(payload).digest()
+    digest = hashlib.sha256()
+    tracemalloc.start()
+    try:
+        with zipfile.ZipFile(zip_path) as zf, zf.open("entry.bin") as fp:
+            reader: Any = fp
+            while output := reader.read1(MIN_READ_SIZE):
+                assert len(output) <= MIN_READ_SIZE
+                digest.update(output)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert digest.digest() == expected_digest
+    assert peak < 1024 * 1024

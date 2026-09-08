@@ -47,6 +47,14 @@ _MAX_INPUT_PER_FRAME = 200 * 1024 * 1024
 # update here too.
 _ZSTD_THREADS = 12
 
+# A zstd block expands to at most 128 KiB. Feeding four compressed bytes at a
+# time lets an RLE block complete without allowing a single call to materialize
+# more than one block's output.
+_ZSTD_DECOMPRESS_INPUT_SIZE = 4
+
+# Release consumed compressed input without repeatedly moving a large buffer.
+_ZSTD_PENDING_COMPACTION_SIZE = 64 * 1024
+
 
 class _MultiFrameZstdCompressObj:
     """A zstd compressobj that chunks its output into multiple frames.
@@ -98,19 +106,15 @@ class _MultiFrameZstdDecompressObj:
     recognise the frame boundary, start a fresh inner decompressobj, and
     continue until all compressed bytes have been consumed.
 
-    The stdlib ``zipfile._read1`` path for non-deflate compression does:
-
-        data = self._decompressor.decompress(data)
-        self._eof = self._decompressor.eof or self._compress_left <= 0
-
-    We return ``eof=False`` always so that ``self._eof`` is driven purely by
-    ``self._compress_left <= 0`` (all compressed bytes fed).  Meanwhile,
-    ``decompress`` buffers leftover bytes from a completed frame and feeds them
-    into the next inner decompressobj.
+    The stdlib ``zipfile._read1`` path for non-deflate compression drives EOF
+    from the compressed input count. We therefore report ``eof=False`` always
+    and retain input after a completed frame for a fresh inner decompressobj.
 
     Since CPython gh-156002, ``_read1`` calls ``decompress(data, max_length)``
-    and reads more compressed bytes only while ``needs_input`` is True (draining
-    with ``decompress(b"")`` otherwise); both are provided here.
+    and reads more compressed bytes only while ``needs_input`` is True. The
+    zstandard decompressobj materializes all output for every input it receives,
+    so bounded calls feed it only a few compressed bytes at a time and retain
+    any output beyond ``max_length`` for subsequent empty-input drains.
     """
 
     def __init__(self) -> None:
@@ -118,26 +122,76 @@ class _MultiFrameZstdDecompressObj:
 
         self._dctx: zstandard.ZstdDecompressor = zstd.ZstdDecompressor()
         self._obj: zstandard.ZstdDecompressionObj = self._dctx.decompressobj()
-        self._pending: bytes = b""
+        self._pending = bytearray()
+        self._pending_offset = 0
+        self._output = bytearray()
+        self._output_offset = 0
 
     def decompress(self, data: bytes, max_length: int = -1) -> bytes:
-        # max_length is accepted but not enforced: the zstandard decompressobj has
-        # no output bound, so withholding bytes here would only copy an expansion
-        # that is already allocated. ZipExtFile buffers oversize returns anyway.
-        self._pending += data
-        out = b""
-        while self._pending:
-            result = self._obj.decompress(self._pending)
-            out += result
-            if self._obj.eof:
-                # Inner frame complete; unused_data holds the start of the next.
-                self._pending = self._obj.unused_data
-                self._obj = self._dctx.decompressobj()
-            else:
-                # All pending input consumed; wait for more.
-                self._pending = b""
+        self._pending.extend(data)
+        if max_length < 0:
+            return self._decompress_unbounded()
+        if max_length == 0:
+            return b""
+        if self._output:
+            return self._take_output(max_length)
+
+        while self._pending_offset < len(self._pending):
+            chunk = memoryview(self._pending)[
+                self._pending_offset : self._pending_offset
+                + _ZSTD_DECOMPRESS_INPUT_SIZE
+            ]
+            result = self._decompress_chunk(chunk)
+            del chunk
+            self._discard_consumed_input()
+            self._output.extend(result)
+            if len(self._output) - self._output_offset >= max_length:
                 break
-        return out
+        return self._take_output(max_length) if self._output else b""
+
+    def _decompress_unbounded(self) -> bytes:
+        pieces: list[bytes] = []
+        if self._output:
+            pieces.append(self._take_output(-1))
+
+        while self._pending_offset < len(self._pending):
+            chunk = memoryview(self._pending)[self._pending_offset :]
+            pieces.append(self._decompress_chunk(chunk))
+            del chunk
+            self._discard_consumed_input()
+
+        return b"".join(pieces)
+
+    def _decompress_chunk(self, chunk: memoryview) -> bytes:
+        result = self._obj.decompress(chunk)
+        if self._obj.eof:
+            consumed = len(chunk) - len(self._obj.unused_data)
+            self._obj = self._dctx.decompressobj()
+        else:
+            consumed = len(chunk) - len(self._obj.unconsumed_tail)
+        if consumed <= 0:
+            raise RuntimeError("zstd decompressor made no progress")
+        self._pending_offset += consumed
+        return result
+
+    def _discard_consumed_input(self) -> None:
+        if self._pending_offset == len(self._pending):
+            self._pending.clear()
+            self._pending_offset = 0
+        elif self._pending_offset >= _ZSTD_PENDING_COMPACTION_SIZE:
+            del self._pending[: self._pending_offset]
+            self._pending_offset = 0
+
+    def _take_output(self, max_length: int) -> bytes:
+        end = len(self._output)
+        if max_length >= 0:
+            end = min(end, self._output_offset + max_length)
+        result = bytes(self._output[self._output_offset : end])
+        self._output_offset = end
+        if self._output_offset == len(self._output):
+            self._output.clear()
+            self._output_offset = 0
+        return result
 
     def flush(self) -> bytes:
         return b""
@@ -149,8 +203,7 @@ class _MultiFrameZstdDecompressObj:
 
     @property
     def needs_input(self) -> bool:
-        # decompress() never leaves input or output pending; nothing to drain.
-        return True
+        return not self._output and self._pending_offset == len(self._pending)
 
 
 def _install_multiframe_patches() -> None:
