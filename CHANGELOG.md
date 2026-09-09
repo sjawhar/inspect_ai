@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
+- Agent Bridge: Continuing a main conversation now restores its state after a one-shot side request temporarily takes tracking.
 
 ## 0.3.265 (17 September 2026)
 
