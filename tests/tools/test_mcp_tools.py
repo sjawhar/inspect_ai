@@ -24,6 +24,7 @@ from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.model import get_model
 from inspect_ai.solver import solver
 from inspect_ai.tool import (
+    ContentText,
     MCPServer,
     Tool,
     ToolError,
@@ -633,6 +634,87 @@ async def test_mcp_task_session_dies_with_its_task() -> None:
     assert session_refs[0]() is None, (
         "a session that was created but never entered outlived its task"
     )
+
+
+class _SampleScope:
+    """Minimal active sample identity used to exercise MCP session ownership."""
+
+    def __init__(self) -> None:
+        self.completed: float | None = None
+        self.task = "test-task"
+        self.epoch = 1
+        self.sample = SimpleNamespace(id="sample")
+
+
+@skip_if_no_mcp_package
+async def test_mcp_session_is_shared_by_child_tasks_of_an_active_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One sample's child tasks must share its local MCP server session."""
+    from inspect_ai.tool._mcp._local import MCPServerLocal, MCPServerLocalSession
+
+    sample = _SampleScope()
+    monkeypatch.setattr(
+        "inspect_ai.log._samples.sample_active", lambda: sample, raising=True
+    )
+    server = MCPServerLocal(_no_transport_client, name="sample-scope", events=False)
+    child_sessions: list[MCPServerLocalSession] = []
+
+    async def child() -> None:
+        child_sessions.append(server._task_session())
+
+    parent_session = server._task_session()
+    async with anyio.create_task_group() as task_group:
+        for _ in range(3):
+            task_group.start_soon(child)
+
+    assert child_sessions == [parent_session, parent_session, parent_session]
+
+
+def _counting_server(counter: Path) -> MCPServer:
+    """Return a real stdio MCP server that records each process launch."""
+    prelude = (
+        f"open({str(counter)!r}, 'a').write('start\\n');"
+        f"exec(open({MCP_TEST_SERVER!r}).read())"
+    )
+    return mcp_server_stdio(command=sys.executable, args=["-c", prelude])
+
+
+@skip_if_no_mcp_package
+async def test_mcp_connection_reuses_one_server_across_sample_child_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested child calls share the active sample's live server process."""
+    sample = _SampleScope()
+    monkeypatch.setattr(
+        "inspect_ai.log._samples.sample_active", lambda: sample, raising=True
+    )
+    counter = tmp_path / "launches.txt"
+    server = _counting_server(counter)
+
+    async with mcp_connection(server):
+        tools = await server.tools()
+        echo = next(tool for tool in tools if ToolDef(tool).name == "echo")
+
+        async def child(index: int) -> None:
+            child_tools = await server.tools()
+            child_echo = next(
+                tool for tool in child_tools if ToolDef(tool).name == "echo"
+            )
+            result = await child_echo(message=f"child-{index}")
+            assert isinstance(result, list) and isinstance(result[0], ContentText)
+            assert result[0].text == f"child-{index}"
+
+        async with anyio.create_task_group() as task_group:
+            for index in range(3):
+                task_group.start_soon(child, index)
+
+        result = await echo(message="parent")
+        assert isinstance(result, list) and isinstance(result[0], ContentText)
+        assert result[0].text == "parent"
+
+    assert counter.read_text().splitlines() == ["start"]
 
 
 def _free_port() -> int:

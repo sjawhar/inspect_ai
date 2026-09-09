@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Compaction: summary compaction now produces a more detailed, structured summary that preserves code snippets, user messages, and any security-relevant constraints stated earlier in the conversation.
+- MCP: Tasks can hold resources open for the duration of a sample, allowing local MCP servers to be reused across its tool calls.
 - Control Channel: `inspect ctl sample cancel` now works on a sample that is still initializing (e.g. waiting on sandbox provisioning) — the cancel applies the moment the sample starts, and `inspect ctl sample list` marks the pending cancel.
 - Sample and Task Sources: `sample_complete()` now fires for a running sample cancelled individually, so a source waiting on that sample no longer stalls; a blocking callback can no longer hang a task cancel.
 - Agent Bridge: Google clients now receive token log probabilities and top candidates returned by the host model.

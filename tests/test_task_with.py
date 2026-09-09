@@ -80,6 +80,11 @@ def test_task_with_version():
     assert task.version == 2
 
 
+def test_task_with_sample_resources():
+    task = task_with(minimal_task(), sample_resources=[])
+    assert task.sample_resources == []
+
+
 @agent
 def minimal_agent() -> Agent:
     async def execute(state: AgentState) -> AgentState:

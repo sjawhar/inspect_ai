@@ -145,30 +145,33 @@ class MCPServerLocal(MCPServer):
     async def tools(self) -> list[Tool]:
         return await self._task_session().tools()
 
-    # create a separate MCPServer session per async task, keyed by the running
-    # task OBJECT, rather than per sample. A handoff/subagent's turn, including
-    # its own tools() resolution, runs in its own child task, so it gets a
-    # fresh connection (empty state, for a stateful server) rather than the
-    # parent's live session. That isolation is intentional (see CHANGELOG),
-    # not a safety requirement: concurrent call_tool on one ClientSession is
-    # safe in the mcp SDK.
-    #
-    # Keying by task id would be both stale and unbounded: anyio's
-    # TaskInfo.id is id()-derived, so an id is reusable once its task is
-    # collected, and a session created but never entered (a plain solver
-    # eval only calls tools()) is never evicted. Weak keys make entries die
-    # with their task instead.
+    def _session_scope(self) -> object:
+        """Return the sample attempt that owns a server, when one is active.
+
+        A sandboxed MCP server is a process inside a sample's sandbox. Sharing
+        the session across child tasks of that attempt avoids starting one
+        process per bridged tool call, while distinct attempts retain separate
+        server processes. Outside an evaluation, preserve task-local sessions.
+        """
+        from inspect_ai.log._samples import sample_active
+
+        active = sample_active()
+        if active is not None and active.completed is None:
+            return active
+        return _current_task()
+
     def _task_session(self) -> "MCPServerLocalSession":
-        task = _current_task()
-        session = self._task_sessions.get(task)
+        scope = self._session_scope()
+        session = self._task_sessions.get(scope)
         if session is None:
             session = MCPServerLocalSession(
                 self._client,
                 name=self._name,
                 events=self._events,
                 timeout=self._timeout,
+                owner=self,
             )
-            self._task_sessions[task] = session
+            self._task_sessions[scope] = session
         return session
 
 
@@ -180,6 +183,7 @@ class MCPServerLocalSession(MCPServer):
         name: str,
         events: bool,
         timeout: int | None = None,
+        owner: "MCPServerLocal | None" = None,
     ) -> None:
         super().__init__()
         self._refcount = 0
@@ -187,6 +191,7 @@ class MCPServerLocalSession(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
+        self._owner = owner
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_tool_list: list[MCPTool] | None = None
@@ -352,36 +357,40 @@ class MCPServerLocalSession(MCPServer):
             parameters=parameters,
         )
 
-    # if we have been entered as a context manager then return that session,
-    # otherwise, create a brand new session from the client
+    # Return this session when entered. A stale tool closure can otherwise
+    # adopt the current sample's live session through its owning server.
     @contextlib.asynccontextmanager
     async def _client_session(self) -> AsyncIterator[ClientSession]:
-        # if _connect has been previously called and we still have the connection
-        # to the session, we can just return nit
         if self._session is not None:
             yield self._session
+            return
 
-        # otherwise, create a new session and yield it (it will be cleaned up
-        # when the context manager exits)
-        else:
-            async with AsyncExitStack() as exit_stack:
-                with trace_action(logger, "MCPServer", f"create client ({self._name})"):
-                    read, write, *_ = await exit_stack.enter_async_context(
-                        self._client()
-                    )
-                with trace_action(
-                    logger, "MCPServer", f"create session ({self._name})"
-                ):
-                    session = await exit_stack.enter_async_context(
-                        ClientSession(
-                            read, write, sampling_callback=self._sampling_fn()
-                        )
-                    )
-                with trace_action(
-                    logger, "MCPServer", f"initialize session ({self._name})"
-                ):
-                    await session.initialize()
-                yield session
+        current = self._current_scope_session()
+        if current is not None:
+            yield current
+            return
+
+        async with AsyncExitStack() as exit_stack:
+            with trace_action(logger, "MCPServer", f"create client ({self._name})"):
+                read, write, *_ = await exit_stack.enter_async_context(self._client())
+            with trace_action(logger, "MCPServer", f"create session ({self._name})"):
+                session = await exit_stack.enter_async_context(
+                    ClientSession(read, write, sampling_callback=self._sampling_fn())
+                )
+            with trace_action(
+                logger, "MCPServer", f"initialize session ({self._name})"
+            ):
+                await session.initialize()
+            yield session
+
+    def _current_scope_session(self) -> ClientSession | None:
+        """Return the live session for the current sample scope, if any."""
+        if self._owner is None:
+            return None
+        current = self._owner._task_session()
+        if current is self:
+            return None
+        return current._session
 
     def _sampling_fn(self) -> SamplingFnT | None:
         from inspect_ai.model._model import active_model
