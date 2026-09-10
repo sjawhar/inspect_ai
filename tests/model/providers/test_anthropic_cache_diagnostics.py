@@ -280,10 +280,17 @@ async def test_assistant_message_id_captured_when_beta_on() -> None:
         cache_diagnostics=True,
     )
     assert output.message.metadata == {"message_id": "msg_xyz"}
+    assert output.provider_response_id == "msg_xyz"
 
 
 @pytest.mark.anyio
 async def test_assistant_message_id_not_captured_when_beta_off() -> None:
+    """With the beta off the message carries no tag, but the output still has the id.
+
+    The message-level tag feeds `diagnostics.previous_message_id` on the next
+    request, so it stays beta-gated; the provider's id is recorded on the
+    output regardless.
+    """
     from anthropic.types import Message, Usage
 
     from inspect_ai.model._providers.anthropic import model_output_from_message
@@ -305,6 +312,7 @@ async def test_assistant_message_id_not_captured_when_beta_off() -> None:
         # cache_diagnostics defaults to False
     )
     assert output.message.metadata is None
+    assert output.provider_response_id == "msg_xyz"
 
 
 @pytest.mark.anyio
@@ -426,6 +434,9 @@ async def test_anthropic_cache_diagnostics_first_turn_live() -> None:
 @pytest.mark.anyio
 @skip_if_no_anthropic
 async def test_anthropic_no_message_id_when_beta_off_live() -> None:
+    """A live beta-off call tags no message id but still records the output id."""
+    import re
+
     model = get_model(
         "anthropic/claude-sonnet-4-6",
         config=GenerateConfig(max_tokens=60, cache_prompt=False),
@@ -435,6 +446,8 @@ async def test_anthropic_no_message_id_when_beta_off_live() -> None:
     )
     md = response.message.metadata
     assert md is None or "message_id" not in md
+    assert response.provider_response_id is not None
+    assert re.match(r"^msg_", response.provider_response_id)
 
 
 @pytest.mark.anyio

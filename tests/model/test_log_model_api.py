@@ -90,7 +90,9 @@ def test_log_model_api_non_error_call_stripped():
     assert event.call is None
 
 
-def _make_model_event(model: str = "test/model") -> ModelEvent:
+def _make_model_event(
+    model: str = "test/model", provider_response_id: str | None = None
+) -> ModelEvent:
     call = ModelCall.create({"model": model}, {"content": "hello"})
     return ModelEvent(
         model=model,
@@ -98,9 +100,36 @@ def _make_model_event(model: str = "test/model") -> ModelEvent:
         tools=[],
         tool_choice="auto",
         config=GenerateConfig(),
-        output=ModelOutput(model=model, choices=[]),
+        output=ModelOutput(
+            model=model, choices=[], provider_response_id=provider_response_id
+        ),
         call=call,
     )
+
+
+def test_provider_response_id_survives_default_call_limit() -> None:
+    """The provider's response id outlives the raw call it arrived on.
+
+    The raw request/response is dropped past the per-model limit, so a sample
+    with more calls than that has no way to name the provider's own record of
+    its later calls. `ModelOutput.provider_response_id` is not subject to the
+    limit and keeps that correlation for every call.
+    """
+    transcript = Transcript(log_model_api=None)
+    init_transcript(transcript)
+
+    events = [
+        _make_model_event(provider_response_id=f"msg_{index}")
+        for index in range(DEFAULT_LOG_MODEL_API_CALLS + 3)
+    ]
+    for event in events:
+        transcript._event(event)
+
+    dropped = events[DEFAULT_LOG_MODEL_API_CALLS:]
+    assert [event.call for event in dropped] == [None] * len(dropped)
+    assert [event.output.provider_response_id for event in dropped] == [
+        f"msg_{index}" for index in range(DEFAULT_LOG_MODEL_API_CALLS, len(events))
+    ]
 
 
 def test_log_model_api_default_keeps_first_n():

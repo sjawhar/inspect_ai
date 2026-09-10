@@ -241,6 +241,7 @@ async def generate_responses(
             choices=choices,
             usage=model_usage_from_response(model_response),
             metadata=dict(response_metadata) if response_metadata else None,
+            provider_response_id=model_response.id or None,
         ), model_call
     except BadRequestError as e:
         model_call.set_error(

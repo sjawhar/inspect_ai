@@ -3345,15 +3345,14 @@ async def model_output_from_message(
                 )
 
     # cache-diagnostics: tag the assistant message with the upstream id so a
-    # subsequent turn can pass it as `diagnostics.previous_message_id`.
-    # The `diagnostics` response field itself is captured below onto the
-    # ModelOutput metadata, not the assistant message. Only when the beta
-    # is on.
+    # subsequent turn can pass it as `diagnostics.previous_message_id`. Gated
+    # on the beta because the tag changes what the next request sends; the id
+    # itself is always recorded on `ModelOutput.provider_response_id` below.
+    # The `diagnostics` response field is captured onto the ModelOutput
+    # metadata, not the assistant message.
     asst_metadata: dict[str, Any] = {}
-    if cache_diagnostics:
-        msg_id = getattr(message, "id", None)
-        if msg_id:
-            asst_metadata["message_id"] = msg_id
+    if cache_diagnostics and message.id:
+        asst_metadata["message_id"] = message.id
 
     # server-side refusal fallback: collect handoffs (in content order) so we
     # can surface the serving model and a structured metadata entry. on a
@@ -3493,6 +3492,7 @@ async def model_output_from_message(
             ),
             fallback=fallback,
             metadata=metadata,
+            provider_response_id=message.id,
         ),
         pause_turn,
     )

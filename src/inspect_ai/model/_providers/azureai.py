@@ -277,6 +277,7 @@ class AzureAIAPI(ModelAPI):
                     output_tokens=response.usage.completion_tokens,
                     total_tokens=response.usage.total_tokens,
                 ),
+                provider_response_id=response.id or None,
             ), model_call
 
         except AzureError as ex:

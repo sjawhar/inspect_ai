@@ -634,6 +634,7 @@ class GrokAPI(ModelAPI):
             choices=[self._completion_choice_from_response(response, tools)],
             completion=response.content,
             usage=_model_usage_from_sampling_usage(response.usage),
+            provider_response_id=response.id or None,
         )
 
     def _completion_choice_from_response(

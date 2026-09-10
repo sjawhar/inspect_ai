@@ -584,6 +584,7 @@ class GoogleGenAIAPI(ModelAPI):
                     model_name, response, has_computer_use
                 ),
                 usage=usage_metadata_to_model_usage(response.usage_metadata),
+                provider_response_id=response.response_id,
             )
 
             return output, model_call
@@ -606,6 +607,9 @@ class GoogleGenAIAPI(ModelAPI):
         """
         candidates_parts: dict[int, list[Part]] = {}
         last_chunk: GenerateContentResponse | None = None
+        # Every chunk of one response carries the same response_id, but it is
+        # optional per chunk, so keep the first one seen rather than the last.
+        response_id: str | None = None
 
         stream = await client.aio.models.generate_content_stream(
             model=model,
@@ -617,6 +621,8 @@ class GoogleGenAIAPI(ModelAPI):
 
         async for chunk in stream:
             last_chunk = chunk
+            if response_id is None and chunk.response_id:
+                response_id = chunk.response_id
 
             # report cumulative output tokens when the chunk carries usage
             # (candidates + thoughts, matching usage_metadata_to_model_usage's
@@ -759,6 +765,7 @@ class GoogleGenAIAPI(ModelAPI):
             candidates=final_candidates,
             usage_metadata=last_chunk.usage_metadata,
             model_version=last_chunk.model_version,
+            response_id=response_id,
         )
 
     @override

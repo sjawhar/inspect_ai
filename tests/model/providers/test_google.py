@@ -15,6 +15,7 @@ from google.genai.types import (
     FinishReason,
     FunctionCall,
     FunctionCallingConfigMode,
+    GenerateContentConfig,
     GenerateContentResponse,
     HttpOptions,
     JobState,
@@ -1843,3 +1844,48 @@ def test_google_credentials_arg_rejected() -> None:
             api_key=None,
             credentials=object(),
         )
+
+
+@pytest.mark.anyio
+async def test_google_stream_keeps_response_id() -> None:
+    """The accumulated streaming response carries the provider's response_id.
+
+    The id is optional on each chunk; the final chunk here omits it, so the
+    accumulator must keep the first one seen rather than read the last chunk.
+    """
+
+    async def chunks():
+        yield GenerateContentResponse(
+            response_id="google-stream-123",
+            candidates=[
+                Candidate(
+                    index=0, content=Content(role="model", parts=[Part(text="Hel")])
+                )
+            ],
+        )
+        yield GenerateContentResponse(
+            candidates=[
+                Candidate(
+                    index=0,
+                    content=Content(role="model", parts=[Part(text="lo")]),
+                    finish_reason=FinishReason.STOP,
+                )
+            ],
+            model_version="gemini-2.0-flash",
+        )
+
+    mock_client = _create_mock_google_client(AsyncMock())
+    mock_client.aio.models.generate_content_stream = AsyncMock(return_value=chunks())
+    with patch("inspect_ai.model._providers.google.Client", return_value=mock_client):
+        api = GoogleGenAIAPI(
+            model_name="gemini-2.0-flash", base_url=None, api_key="test-key"
+        )
+        response = await api._stream_generate_content(
+            mock_client, "gemini-2.0-flash", [], GenerateContentConfig()
+        )
+
+    assert response.response_id == "google-stream-123"
+    assert response.candidates is not None
+    assert response.candidates[0].content is not None
+    assert response.candidates[0].content.parts is not None
+    assert response.candidates[0].content.parts[0].text == "Hello"

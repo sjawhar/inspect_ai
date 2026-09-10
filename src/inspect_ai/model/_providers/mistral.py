@@ -278,6 +278,7 @@ class MistralAPI(ModelAPI):
                     ),
                     total_tokens=completion.usage.total_tokens,
                 ),
+                provider_response_id=completion.id or None,
             ), model_call
 
     def service_model_name(self) -> str:

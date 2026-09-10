@@ -246,10 +246,24 @@ def cache_fetch(entry: CacheEntry) -> ModelOutput | None:
                 filename.unlink(missing_ok=True)
                 return None
 
-            return output
+            return _with_current_fields(output)
     except Exception as e:
         trace(f"Failed to fetch from cache {filename}: {e}")
         return None
+
+
+def _with_current_fields(output: ModelOutput) -> ModelOutput:
+    """Give a cached output any fields added to ModelOutput since it was written.
+
+    Entries are pickled instances, and unpickling restores the object's stored
+    attributes without running validation, so a field added after the entry
+    was written is simply absent -- reading it raises AttributeError rather
+    than returning its default. Re-validating from the dump fills the defaults
+    in. Only entries that are actually missing a field pay for the round trip.
+    """
+    if type(output).model_fields.keys() <= output.__dict__.keys():
+        return output
+    return ModelOutput.model_validate(output.model_dump())
 
 
 def cache_clear(model: str = "") -> bool:

@@ -942,6 +942,7 @@ def model_output_from_openai(
             if completion.usage
             else None
         ),
+        provider_response_id=completion.id or None,
     )
 
 

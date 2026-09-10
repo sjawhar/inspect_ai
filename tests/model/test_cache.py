@@ -1,3 +1,4 @@
+import pickle
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from inspect_ai.model import (
     GenerateConfig,
     ModelOutput,
 )
-from inspect_ai.model._cache import CacheEntry, cache_fetch, cache_store
+from inspect_ai.model._cache import CacheEntry, cache_fetch, cache_path, cache_store
 from inspect_ai.solver import generate
 
 
@@ -93,3 +94,40 @@ def test_cache_skips_content_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     fetched = cache_fetch(cache_entry())
     assert fetched is not None
     assert fetched.completion == "Hi"
+
+
+def test_cache_entry_written_before_a_field_existed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An entry pickled by an older ModelOutput reads back with current defaults.
+
+    Unpickling restores stored attributes without validation, so a field added
+    after the entry was written is absent from the object -- reading it raises
+    rather than returning its default -- unless the fetch normalizes it.
+    """
+    monkeypatch.setenv("INSPECT_CACHE_DIR", str(tmp_path))
+    entry = CacheEntry(
+        base_url=None,
+        config=GenerateConfig(),
+        input=[ChatMessageUser(content="Hello")],
+        model="mockllm/model",
+        policy=CachePolicy(),
+        tool_choice=None,
+        tools=[],
+    )
+    output = ModelOutput.from_content(model="mockllm/model", content="Hi")
+    assert cache_store(entry=entry, output=output) is True
+
+    # rewrite the stored entry as an older ModelOutput would have pickled it:
+    # the same object with the newer field never having been set
+    filename = cache_path(model=entry.model) / entry.key
+    with open(filename, "rb") as f:
+        expiry, stored = pickle.load(f)
+    del stored.__dict__["provider_response_id"]
+    with open(filename, "wb") as f:
+        pickle.dump((expiry, stored), f)
+
+    fetched = cache_fetch(entry)
+    assert fetched is not None
+    assert fetched.completion == "Hi"
+    assert fetched.provider_response_id is None
