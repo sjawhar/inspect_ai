@@ -167,10 +167,12 @@ async def inspect_anthropic_api_request_impl(
     # update state if we have more messages than the last generation
     await bridge._track_state(messages, output)
 
-    # return message (use beta message type if request came from beta endpoint)
+    # return message (use beta message type if request came from beta endpoint).
+    # The provider's own response id is preferred over our per-message uuid so a
+    # bridged call is traceable back to the provider that answered it.
     message_class = BetaMessage if beta else Message
     message = message_class.model_construct(
-        id=output.message.id or uuid(),
+        id=output.provider_response_id or output.message.id or uuid(),
         content=await assistant_message_blocks(output.message, beta=beta),
         model=output.model,
         role="assistant",

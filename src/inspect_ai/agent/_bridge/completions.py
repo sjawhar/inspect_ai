@@ -100,7 +100,7 @@ async def inspect_completions_api_request(
 
     # inspect completion to openai completion
     return ChatCompletion(
-        id=uuid(),
+        id=output.provider_response_id or output.message.id or uuid(),
         created=int(time()),
         object="chat.completion",
         choices=openai_chat_choices(output.choices),

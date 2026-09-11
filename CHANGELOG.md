@@ -4,6 +4,7 @@
 - Eval Set: An external runner driving `eval_set()` can now override any argument that does not change task identity, rather than only five.
 - Eval Set: An eval set driven by an external runner now honors the `INSPECT_EVAL_*` environment variables with the same meanings `inspect eval-set` gives them.
 - Model API: Model output now records the provider's own response id, so a call can still be matched to the provider's record after the raw request/response is dropped.
+- Agent Bridge: A bridged scaffold now sees the provider's own response id on the messages it receives, so a call it logs can be matched to the provider's record.
 
 ## 0.3.261 (30 August 2026)
 

@@ -323,7 +323,7 @@ async def inspect_responses_api_request_impl(
 
     # return response
     response = Response(
-        id=output.message.id or uuid(),
+        id=output.provider_response_id or output.message.id or uuid(),
         created_at=int(time()),
         incomplete_details=responses_incomplete_details(output.stop_reason),
         model=model_name,

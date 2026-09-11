@@ -14,8 +14,8 @@ covered here too.
 
 from anthropic import AsyncAnthropic
 from anthropic.types import Message as AnthropicMessage
-from anthropic.types import TextBlock, ToolUseBlock
-from anthropic.types.beta import BetaMessage, BetaTextBlock
+from anthropic.types import MessageParam, TextBlock, ToolUseBlock
+from anthropic.types.beta import BetaMessage, BetaMessageParam, BetaTextBlock
 from openai import AsyncOpenAI
 from openai.types.chat import (
     ChatCompletion,
@@ -220,7 +220,13 @@ def anthropic_bridge_client() -> AsyncAnthropic:
     return AsyncAnthropic(api_key="test")
 
 
-ANTHROPIC_MESSAGES = [{"role": "user", "content": "hello"}]
+# Typed as the SDK's own parameter type: an untyped dict literal forces every
+# call site below to suppress `arg-type`, and this repo does not take
+# suppressions where a type is available.
+ANTHROPIC_MESSAGES: list[MessageParam] = [{"role": "user", "content": "hello"}]
+# The beta endpoint takes the beta parameter type; sharing one untyped literal
+# across both is what forced the suppressions.
+ANTHROPIC_BETA_MESSAGES: list[BetaMessageParam] = [{"role": "user", "content": "hello"}]
 
 
 async def consume_anthropic_raw_response() -> AnthropicMessage:
@@ -229,7 +235,7 @@ async def consume_anthropic_raw_response() -> AnthropicMessage:
         raw = await client.messages.with_raw_response.create(
             model="inspect",
             max_tokens=1024,
-            messages=ANTHROPIC_MESSAGES,  # type: ignore[arg-type]
+            messages=ANTHROPIC_MESSAGES,
         )
         assert raw.headers is not None
         # anthropic >= 1.0: with_raw_response returns AsyncAPIResponse (not
@@ -282,7 +288,7 @@ def anthropic_raw_response_beta_agent() -> Agent:
                 raw = await client.beta.messages.with_raw_response.create(
                     model="inspect",
                     max_tokens=1024,
-                    messages=ANTHROPIC_MESSAGES,  # type: ignore[arg-type]
+                    messages=ANTHROPIC_BETA_MESSAGES,
                 )
                 assert raw.headers is not None
                 message = await raw.parse()
@@ -305,7 +311,7 @@ def anthropic_streaming_response_agent() -> Agent:
                 async with client.messages.with_streaming_response.create(
                     model="inspect",
                     max_tokens=1024,
-                    messages=ANTHROPIC_MESSAGES,  # type: ignore[arg-type]
+                    messages=ANTHROPIC_MESSAGES,
                 ) as raw:
                     assert raw.headers is not None
                     # unlike the legacy raw wrapper, this one parses async
@@ -329,7 +335,7 @@ def anthropic_plain_response_agent() -> Agent:
                 message = await client.messages.create(
                     model="inspect",
                     max_tokens=1024,
-                    messages=ANTHROPIC_MESSAGES,  # type: ignore[arg-type]
+                    messages=ANTHROPIC_MESSAGES,
                 )
                 assert isinstance(message, AnthropicMessage)
                 block = message.content[0]
@@ -386,4 +392,107 @@ def test_anthropic_bridge_with_streaming_response_parses() -> None:
     run_bridge_test(
         anthropic_streaming_response_agent(),
         ModelOutput.from_content("mockllm/model", ANSWER),
+    )
+
+
+# The id a bridged client reads off its response. Inspect assigns every
+# ChatMessageAssistant a local shortuuid, so before the builders preferred
+# `provider_response_id` a scaffold citing this field quoted an identifier that
+# resolved nowhere.
+PROVIDER_RESPONSE_ID = "msg_011CewwngkKy1kzQAwArWH2Q"
+
+
+def output_with_provider_id(provider_response_id: str | None) -> ModelOutput:
+    output = ModelOutput.from_content("mockllm/model", ANSWER)
+    output.provider_response_id = provider_response_id
+    return output
+
+
+@agent
+def anthropic_response_id_agent(expected: str | None) -> Agent:
+    """Assert the Anthropic message carries the provider's id, or the message's."""
+
+    async def execute(state: AgentState) -> AgentState:
+        async with agent_bridge(state) as bridge:
+            async with anthropic_bridge_client() as client:
+                message = await client.messages.create(
+                    model="inspect",
+                    max_tokens=1024,
+                    messages=ANTHROPIC_MESSAGES,
+                )
+                assert isinstance(message, AnthropicMessage)
+                if expected is not None:
+                    assert message.id == expected
+                else:
+                    # No provider id: the message's own id, never a fresh uuid the
+                    # transcript does not know.
+                    assert message.id == bridge.state.output.message.id
+            return bridge.state
+
+    return execute
+
+
+@agent
+def completions_response_id_agent(expected: str) -> Agent:
+    """Assert the OpenAI chat completion carries the provider's id."""
+
+    async def execute(state: AgentState) -> AgentState:
+        async with agent_bridge(state) as bridge:
+            async with bridge_client() as client:
+                completion = await client.chat.completions.create(
+                    model="inspect",
+                    messages=await messages_to_openai(bridge.state.messages),
+                )
+                assert isinstance(completion, ChatCompletion)
+                assert completion.id == expected
+            return bridge.state
+
+    return execute
+
+
+@agent
+def responses_response_id_agent(expected: str) -> Agent:
+    """Assert the OpenAI response carries the provider's id."""
+
+    async def execute(state: AgentState) -> AgentState:
+        async with agent_bridge(state) as bridge:
+            async with bridge_client() as client:
+                response = await client.responses.create(model="inspect", input="hello")
+                assert isinstance(response, Response)
+                assert response.id == expected
+            return bridge.state
+
+    return execute
+
+
+@skip_if_no_anthropic_package
+def test_anthropic_bridge_returns_the_providers_response_id() -> None:
+    run_bridge_test(
+        anthropic_response_id_agent(PROVIDER_RESPONSE_ID),
+        output_with_provider_id(PROVIDER_RESPONSE_ID),
+    )
+
+
+@skip_if_no_openai_package
+def test_completions_bridge_returns_the_providers_response_id() -> None:
+    run_bridge_test(
+        completions_response_id_agent(PROVIDER_RESPONSE_ID),
+        output_with_provider_id(PROVIDER_RESPONSE_ID),
+    )
+
+
+@skip_if_no_openai_package
+def test_responses_bridge_returns_the_providers_response_id() -> None:
+    run_bridge_test(
+        responses_response_id_agent(PROVIDER_RESPONSE_ID),
+        output_with_provider_id(PROVIDER_RESPONSE_ID),
+    )
+
+
+@skip_if_no_anthropic_package
+def test_anthropic_bridge_falls_back_to_the_message_id() -> None:
+    """A synthetic or filter-produced output reports no provider id."""
+    run_bridge_test(
+        anthropic_response_id_agent(None),
+        output_with_provider_id(None),
     )
