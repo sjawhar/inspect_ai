@@ -1,6 +1,7 @@
+from collections.abc import Callable
 from enum import IntEnum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn, Sequence, Set
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, Sequence, Set
 
 from shortuuid import uuid
 
