@@ -3,6 +3,8 @@
 - Eval Set: `eval_set()` now defaults `log_dir` to `INSPECT_LOG_DIR` or `./logs`, as `eval()` does, rather than requiring it.
 - Eval Set: An external runner driving `eval_set()` can now override any argument that does not change task identity, rather than only five.
 - Eval Set: An eval set driven by an external runner now honors the `INSPECT_EVAL_*` environment variables with the same meanings `inspect eval-set` gives them.
+- Anthropic: Forcing the `web_search` tool via `tool_choice` on Claude 4.6+ models no longer fails with a 400 (`allowed_callers`); Claude Code's WebSearch works through the agent bridge again, and `allowed_callers` can be set explicitly.
+- Agent Bridge: A provider error delivered mid-stream (SSE `error` event on a 200 response) now reaches the bridged agent with the provider's real status instead of HTTP 200.
 
 ## 0.3.261 (30 August 2026)
 

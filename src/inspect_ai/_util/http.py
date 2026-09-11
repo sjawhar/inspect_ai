@@ -16,11 +16,51 @@ def status_code_of(ex: BaseException) -> int | None:
     wrappers: `status_code` (Anthropic/OpenAI SDKs, `ModelGenerateError`) and
     `code` (google-genai `APIError`). Returns None when no integer status is
     found.
+
+    A 2xx status on an exception is not the error's status: it is the status of
+    a streaming response whose body then carried an `error` event (the Anthropic
+    SDK raises `APIStatusError` with `status_code` of the 200 stream in that
+    case). The status is then taken from the error body's `type` instead, so
+    retry classification and forwarded errors see the provider's 4xx/5xx rather
+    than a success code.
     """
     for attr in ("status_code", "code"):
         value = getattr(ex, attr, None)
         if isinstance(value, int):
+            if 200 <= value < 300:
+                return _status_from_error_body(getattr(ex, "body", None))
             return value
+    return None
+
+
+# Anthropic error `type` -> HTTP status (https://docs.anthropic.com/en/api/errors).
+_ANTHROPIC_ERROR_TYPE_STATUS = {
+    "invalid_request_error": 400,
+    "authentication_error": 401,
+    "billing_error": 402,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "request_too_large": 413,
+    "rate_limit_error": 429,
+    "timeout_error": 408,
+    "api_error": 500,
+    "overloaded_error": 529,
+}
+
+
+def _status_from_error_body(body: object) -> int | None:
+    """Status implied by a provider error body, for errors delivered on a 2xx stream."""
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return None
+    status = error.get("status", error.get("code"))
+    if isinstance(status, int) and not (200 <= status < 300):
+        return status
+    error_type = error.get("type")
+    if isinstance(error_type, str):
+        return _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)
     return None
 
 
