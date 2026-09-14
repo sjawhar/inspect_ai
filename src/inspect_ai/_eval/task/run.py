@@ -359,6 +359,7 @@ class _RecordSampleTerminal(Protocol):
         tokens: int = 0,
         messages: int = 0,
         started: float | None = None,
+        operator_interrupted: bool = False,
     ) -> None: ...
 
 
@@ -446,6 +447,7 @@ class SampleTerminalReporter:
         *,
         started: float | None = None,
         usage: _SampleUsage | None = None,
+        operator_interrupted: bool = False,
     ) -> None:
         """The run errored terminally (retries exhausted or none configured).
 
@@ -455,6 +457,10 @@ class SampleTerminalReporter:
         be raised (the eval dies with ``results=None``, so scores would have
         nothing to contribute to and notifying metrics/early-stopping for a
         dying task would mislead; they remain in the sample log).
+
+        ``operator_interrupted`` marks this error as a deliberate operator
+        ``action="error"`` sample interrupt rather than a genuine failure
+        (see :func:`inspect_ai._control.eval_state.record_sample_errored`).
         """
         await self._report(
             record_sample_errored,
@@ -464,6 +470,7 @@ class SampleTerminalReporter:
             scores,
             started=started,
             usage=usage,
+            operator_interrupted=operator_interrupted,
         )
 
     def cancelled(
@@ -500,9 +507,16 @@ class SampleTerminalReporter:
         *,
         started: float | None,
         usage: _SampleUsage | None,
+        operator_interrupted: bool = False,
     ) -> None:
         """Counter and slot release first, then metrics (when scored)."""
-        self._record_and_release(record, outcome, started=started, usage=usage)
+        self._record_and_release(
+            record,
+            outcome,
+            started=started,
+            usage=usage,
+            operator_interrupted=operator_interrupted,
+        )
         if scores is not None:
             await self._sample_complete(sample_id, epoch, scores)
 
@@ -513,6 +527,7 @@ class SampleTerminalReporter:
         *,
         started: float | None,
         usage: _SampleUsage | None,
+        operator_interrupted: bool = False,
     ) -> None:
         assert not self._reported, "sample run already reported a terminal outcome"
         self._reported = True
@@ -522,6 +537,7 @@ class SampleTerminalReporter:
             started=started,
             tokens=usage.tokens,
             messages=usage.messages,
+            operator_interrupted=operator_interrupted,
         )
         if self._sample_terminal is not None:
             self._sample_terminal(outcome)
@@ -2504,6 +2520,7 @@ async def _task_run_sample_attempt(
             raise_error: BaseException | None = None
             cancelled_error: BaseException | None = None
             operator_cancelled = False
+            operator_errored = False
             results: ScoresByScorer = {}
             limit: EvalSampleLimit | None = None
             sample_summary: EvalSampleSummary | None = None
@@ -2651,6 +2668,7 @@ async def _task_run_sample_attempt(
                                 # access to state, limit, and errors
                                 nonlocal state, limit, error, raise_error
                                 nonlocal cancelled_error, operator_cancelled
+                                nonlocal operator_errored
 
                                 try:
                                     # start the sample
@@ -2755,6 +2773,7 @@ async def _task_run_sample_attempt(
                                                 # reconciliation, retry
                                                 # seeding) treat it as
                                                 # cancelled
+                                                operator_errored = True
                                                 operator_error = RuntimeError(
                                                     "Sample errored: interrupted by operator"
                                                 )
@@ -3275,6 +3294,7 @@ async def _task_run_sample_attempt(
             state.epoch,
             started=_sample_started(),
             usage=_sample_usage(state),
+            operator_interrupted=operator_errored,
         )
         raise raise_error
 
@@ -3292,6 +3312,7 @@ async def _task_run_sample_attempt(
             results or None,
             started=_sample_started(),
             usage=_sample_usage(state),
+            operator_interrupted=operator_errored,
         )
         return results if results else None
 

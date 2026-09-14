@@ -25,6 +25,7 @@ from typing_extensions import Unpack
 from inspect_ai._control.eval_state import (
     clear_eval_retry_pending,
     mark_eval_retry_pending,
+    task_error_is_operator_interrupt_only,
     task_retry_abandoned,
 )
 from inspect_ai._control.max_tasks import (
@@ -864,7 +865,21 @@ async def run_task_retry_attempts(
                             f"sample resolution '{run.cancel_type}'"
                         )
                     elif result.status == "error":
-                        retry = True
+                        if task_error_is_operator_interrupt_only(
+                            options.logger.eval.eval_id
+                        ):
+                            # every errored sample this attempt saw was a
+                            # deliberate operator `action="error"` interrupt
+                            # (eg. a hosted human-eval operator ending their
+                            # own session) — no one is left to drive an
+                            # automatic same-run retry, unlike a genuine
+                            # transient failure
+                            log.info(
+                                f"Task '{options.task.name}' errored from an "
+                                "operator interrupt — not retried"
+                            )
+                        else:
+                            retry = True
                     retry = retry and item.retries_remaining > 0
 
                     # a drain/plain cancel issued while this attempt was

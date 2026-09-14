@@ -190,6 +190,16 @@ class EvalState:
     stuck "running", but kept separate from :attr:`errored` so it doesn't
     render as a failure."""
 
+    operator_errored: int = 0
+    """Of :attr:`errored`, how many were resolved by a deliberate operator
+    ``action="error"`` sample interrupt (``ActiveSample.interrupt("error")`` —
+    the live path behind ``ctl sample cancel --action=error`` and a hosted
+    human-eval operator ending their own session) rather than a genuine
+    failure. Lets :func:`task_error_is_operator_interrupt_only` tell "every
+    error this attempt saw was an operator ending it" from "some error was a
+    real failure" without re-reading the (possibly header-only) log — see
+    the automatic same-run retry decision in ``_eval/run.py``."""
+
     task: str = ""
     """Task name. Carried here so consumers (control channel `tasks`) can label
     the eval even after all its samples have exited ``active_samples``
@@ -594,7 +604,12 @@ async def resolve_deferred_sample_stats(state: EvalState) -> None:
 
 
 def record_sample_completed(
-    eval_id: str, *, tokens: int = 0, messages: int = 0, started: float | None = None
+    eval_id: str,
+    *,
+    tokens: int = 0,
+    messages: int = 0,
+    started: float | None = None,
+    operator_interrupted: bool = False,
 ) -> None:
     """Mark a sample as having finished successfully, accumulating its usage.
 
@@ -604,7 +619,10 @@ def record_sample_completed(
     (the "usage so far"). ``started`` is the sample's start time, folded into
     the eval's running-minimum start (see :attr:`EvalState.started_at`) so a
     sample that finished before any control poll still pins the eval start.
-    Silently no-ops if the eval isn't registered.
+    ``operator_interrupted`` is part of the shared ``_RecordSampleTerminal``
+    signature (see :func:`record_sample_errored`) but has no effect here — a
+    completed sample was not resolved as an error. Silently no-ops if the
+    eval isn't registered.
     """
     with _lock:
         state = _eval_states.get(eval_id)
@@ -617,19 +635,31 @@ def record_sample_completed(
 
 
 def record_sample_errored(
-    eval_id: str, *, tokens: int = 0, messages: int = 0, started: float | None = None
+    eval_id: str,
+    *,
+    tokens: int = 0,
+    messages: int = 0,
+    started: float | None = None,
+    operator_interrupted: bool = False,
 ) -> None:
     """Mark a sample as having finished with an error, accumulating its usage.
 
     Called once per sample at the final outcome (after retries are exhausted).
     ``tokens`` / ``messages`` / ``started`` are handled exactly as in
-    :func:`record_sample_completed`. Silently no-ops if the eval isn't
-    registered.
+    :func:`record_sample_completed`. ``operator_interrupted`` marks this
+    error as a deliberate operator ``action="error"`` sample interrupt rather
+    than a genuine failure (see :attr:`EvalState.operator_errored`) — it is
+    still counted as a genuine error everywhere else (``fail_on_error``,
+    ``sample show``/``list``, later ``eval-retry`` eligibility); only the
+    automatic same-run retry decision treats it differently. Silently no-ops
+    if the eval isn't registered.
     """
     with _lock:
         state = _eval_states.get(eval_id)
         if state is not None:
             state.errored += 1
+            if operator_interrupted:
+                state.operator_errored += 1
             state.total_tokens += tokens
             state.total_messages += messages
             state.observe_started(started)
@@ -637,14 +667,21 @@ def record_sample_errored(
 
 
 def record_sample_cancelled(
-    eval_id: str, *, tokens: int = 0, messages: int = 0, started: float | None = None
+    eval_id: str,
+    *,
+    tokens: int = 0,
+    messages: int = 0,
+    started: float | None = None,
+    operator_interrupted: bool = False,
 ) -> None:
     """Mark a sample as terminally cancelled (sibling failure / eval cancel).
 
     Terminal but not a genuine error — counted toward the finish total (so the
     eval isn't stuck "running") in its own bucket, separate from ``errored``.
-    Usage and ``started`` accumulate like the other terminal records. No-ops if
-    unregistered.
+    Usage and ``started`` accumulate like the other terminal records.
+    ``operator_interrupted`` is part of the shared ``_RecordSampleTerminal``
+    signature (see :func:`record_sample_errored`) but has no effect here — a
+    cancelled sample was not resolved as an error. No-ops if unregistered.
     """
     with _lock:
         state = _eval_states.get(eval_id)
@@ -916,6 +953,31 @@ def reset_retry_abandoned() -> None:
     """Reset the retry-abandoned registry (run boundary — see :func:`reset_run_registries`)."""
     with _lock:
         _retry_abandoned_tasks.clear()
+
+
+def task_error_is_operator_interrupt_only(eval_id: str) -> bool:
+    """Whether every errored sample this attempt saw was an operator interrupt.
+
+    Deliberate operator ``action="error"`` interrupts (see
+    :attr:`EvalState.operator_errored`), rather than a genuine failure.
+
+    Consulted by the run dispatcher (``_eval/run.py``) before scheduling an
+    automatic same-run retry (``task_retry_attempts``) of an errored attempt:
+    an operator explicitly ending a sample has no one left to drive an
+    immediate re-run, unlike a transient failure (a sandbox provisioning
+    error, a dropped connection) which should still retry. ``False`` when
+    the eval isn't registered or recorded no errored samples at all — an
+    eval-level failure with no errored samples (e.g. a setup error before
+    any sample started) can't be attributed to an operator and must remain
+    eligible for retry.
+    """
+    with _lock:
+        state = _eval_states.get(eval_id)
+        return (
+            state is not None
+            and state.errored > 0
+            and state.errored == state.operator_errored
+        )
 
 
 # Tasks resolved by a graceful cancel/drain (a stamped "score" / "error" /

@@ -25,7 +25,7 @@ from test_helpers.utils import (
     sleep_for_solver,
 )
 
-from inspect_ai import Epochs, Task, eval, task
+from inspect_ai import Epochs, Task, eval, eval_async, task
 from inspect_ai._eval.evalset import (
     GENERATE_CONFIG_FIELDS_TO_EXCLUDE,
     EvalSetArgsInTaskIdentifier,
@@ -2732,3 +2732,107 @@ def test_eval_set_incomplete_action_error_recovers_once(
         assert len(logs) == 1
         assert logs[0].status == "success"
         assert "-recovered" not in (logs[0].location or "")
+
+
+async def test_eval_set_does_not_retry_operator_errored_sample(tmp_path: Path) -> None:
+    """A sample an operator ends with `action="error"` is not auto-retried.
+
+    `eval_set`'s automatic same-run retry (`task_retry_attempts`, exercised
+    directly here via `eval_async`) retries any errored attempt. An
+    operator-interrupted sample lands in the same `status="error"` bucket as
+    a genuine failure (by design, so it stays retryable via a later `inspect
+    eval-retry`), so without the fix it gets retried immediately too —
+    pointlessly, since the operator who ended it isn't coming back to drive
+    the retry. This must produce exactly one log, not two.
+    """
+    import anyio
+
+    from inspect_ai._control.eval_state import get_eval_states
+    from inspect_ai._control.state import find_active_sample
+
+    release = anyio.Event()
+
+    @solver
+    def _park_until_released():
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            with anyio.fail_after(60):
+                await release.wait()
+            return state
+
+        return solve
+
+    task = Task(
+        dataset=[Sample(id="1", input="x", target="y")],
+        solver=_park_until_released(),
+        name="operator_error_no_retry",
+    )
+
+    log_dir = str(tmp_path / "logs")
+    logs: list[EvalLog] = []
+
+    async with anyio.create_task_group() as tg:
+
+        async def run_eval() -> None:
+            logs.extend(
+                await eval_async(
+                    task,
+                    log_dir=log_dir,
+                    task_retry_attempts=1,
+                    model="mockllm/model",
+                    ctl_server=False,
+                )
+            )
+
+        tg.start_soon(run_eval)
+
+        with anyio.fail_after(60):
+            while True:
+                states = get_eval_states()
+                if states:
+                    active = find_active_sample(states[0].eval_id, "1", 1)
+                    if active is not None and active.started is not None:
+                        break
+                await anyio.sleep(0.01)
+
+        assert active is not None
+        active.interrupt("error")
+        release.set()
+
+    assert len(logs) == 1
+    assert logs[0].status == "error"
+    log_files = [f for f in os.listdir(log_dir) if f.endswith(".eval")]
+    assert len(log_files) == 1
+
+
+def test_eval_set_retries_genuine_error_not_operator_interrupt(
+    tmp_path: Path,
+) -> None:
+    """A genuine (non-operator) error is still auto-retried, and succeeds."""
+    attempts = {"count": 0}
+
+    @solver
+    def _fails_first_attempt():
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("transient failure, e.g. sandbox provisioning")
+            return state
+
+        return solve
+
+    task = Task(
+        dataset=[Sample(input="x", target="y")],
+        solver=_fails_first_attempt(),
+        name="genuine_error_retries",
+    )
+
+    success, logs = eval_set(
+        [task],
+        log_dir=str(tmp_path / "logs"),
+        retry_attempts=1,
+        retry_wait=0.1,
+        retry_immediate=True,
+        model="mockllm/model",
+    )
+    assert success
+    assert attempts["count"] == 2
