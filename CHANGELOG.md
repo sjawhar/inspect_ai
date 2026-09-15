@@ -3,6 +3,7 @@
 - Eval Set: `eval_set()` now defaults `log_dir` to `INSPECT_LOG_DIR` or `./logs`, as `eval()` does, rather than requiring it.
 - Eval Set: An external runner driving `eval_set()` can now override any argument that does not change task identity, rather than only five.
 - Eval Set: An eval set driven by an external runner now honors the `INSPECT_EVAL_*` environment variables with the same meanings `inspect eval-set` gives them.
+- Tools: A tool argument a model fills with a value its schema allowed but the underlying type rejects is now returned as a retryable error instead of ending the sample.
 
 ## 0.3.261 (30 August 2026)
 
