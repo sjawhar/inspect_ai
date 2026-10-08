@@ -2,6 +2,7 @@ import json
 from logging import getLogger
 from typing import Any, cast
 
+from openai import APIStatusError
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
@@ -11,6 +12,7 @@ from typing_extensions import NotRequired, TypedDict, override
 
 from inspect_ai._util.content import ContentReasoning
 from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.http import parse_retry_after_from_exception
 from inspect_ai._util.logger import warn_once
 from inspect_ai.model import _openrouter_reasoning
 from inspect_ai.model._chat_message import ChatMessage
@@ -163,6 +165,10 @@ class OpenRouterAPI(OpenAICompatibleAPI):
             return RetryDecision.transient()
         if isinstance(ex, json.JSONDecodeError):
             return RetryDecision.transient()
+        if _in_flight_budget_exhausted(ex):
+            return RetryDecision.rate_limit(
+                retry_after=parse_retry_after_from_exception(ex)
+            )
         return RetryDecision.no()
 
     @override
@@ -422,6 +428,29 @@ class OpenRouterAPI(OpenAICompatibleAPI):
                 params[EXTRA_BODY]["reasoning"] = reasoning
 
         return params
+
+
+def _in_flight_budget_exhausted(ex: BaseException) -> bool:
+    """Whether `ex` is OpenRouter's 402 for a full in-flight spending budget.
+
+    OpenRouter caps the estimated cost of running and recently completed
+    requests relative to the balance, and refuses a request that doesn't fit
+    with a 402 and a `Retry-After` header, even when the balance is positive.
+    That refusal clears once in-flight costs settle, so it is retried as a
+    rate limit. OpenRouter documents `limit_source` as the field to branch on:
+    other 402s (`openrouter_credits` for an empty balance or a single request
+    larger than the whole budget, `openrouter_key_limit` for a per-key cap)
+    don't clear on retry.
+    https://openrouter.ai/docs/api-reference/limits#in-flight-spending-budget
+    """
+    if not isinstance(ex, APIStatusError) or ex.status_code != 402:
+        return False
+    body = ex.body
+    metadata = body.get("metadata") if isinstance(body, dict) else None
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("limit_source") == "openrouter_in_flight_budget"
+    )
 
 
 def _requires_reasoning_content(model_name: str) -> bool:

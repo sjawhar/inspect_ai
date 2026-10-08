@@ -410,6 +410,84 @@ def test_openrouter_json_decode_classifies_as_transient() -> None:
     assert decision.kind == "transient"
 
 
+# OpenRouter error bodies for two production 402s, verbatim except for the
+# account id. Only `metadata.limit_source` tells them apart.
+_OPENROUTER_IN_FLIGHT_BUDGET_402: dict[str, object] = {
+    "error": {
+        "message": "This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits.",
+        "code": 402,
+        "metadata": {
+            "reason": "in_flight_budget_exhausted",
+            "limit_source": "openrouter_in_flight_budget",
+            "remedy_hint": "Retry after your in-flight requests settle (see the Retry-After header). Adding credits at https://openrouter.ai/settings/credits raises your in-flight budget, up to a capped ceiling.",
+            "headers": {"Retry-After": "120"},
+            "provider_name": None,
+        },
+    }
+}
+_OPENROUTER_INSUFFICIENT_CREDITS_402: dict[str, object] = {
+    "error": {
+        "message": "Insufficient credits. Add more using https://openrouter.ai/settings/credits",
+        "code": 402,
+        "metadata": {
+            "limit_source": "openrouter_credits",
+            "remedy_hint": "Add credits at https://openrouter.ai/settings/credits, or lower max_tokens / prompt size to fit your remaining balance.",
+        },
+    }
+}
+
+
+async def _openai_sdk_status_error(
+    status: int, body: dict[str, object], headers: dict[str, str]
+) -> BaseException:
+    """The exception the OpenAI SDK raises when a chat completion gets this response."""
+    from openai import APIStatusError, AsyncOpenAI, DefaultAsyncHttpxClient
+
+    http_client = DefaultAsyncHttpxClient(
+        transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(status, json=body, headers=headers)
+        )
+    )
+    client = AsyncOpenAI(
+        api_key="test",
+        base_url="https://example.com/v1",
+        http_client=http_client,
+        max_retries=0,
+    )
+    try:
+        with pytest.raises(APIStatusError) as excinfo:
+            await client.chat.completions.create(
+                model="test-model", messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        await client.close()
+    return excinfo.value
+
+
+async def test_openrouter_in_flight_budget_402_classifies_as_rate_limit() -> None:
+    """A 402 for a full in-flight spending budget clears once in-flight costs settle."""
+    from inspect_ai.model._providers.openrouter import OpenRouterAPI
+
+    ex = await _openai_sdk_status_error(
+        402, _OPENROUTER_IN_FLIGHT_BUDGET_402, {"retry-after": "120"}
+    )
+    decision = OpenRouterAPI.__new__(OpenRouterAPI).should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is True
+    assert decision.kind == "rate_limit"
+    assert decision.retry_after == 120.0
+
+
+async def test_openrouter_insufficient_credits_402_does_not_retry() -> None:
+    """A 402 for an empty balance doesn't clear on retry."""
+    from inspect_ai.model._providers.openrouter import OpenRouterAPI
+
+    ex = await _openai_sdk_status_error(402, _OPENROUTER_INSUFFICIENT_CREDITS_402, {})
+    decision = OpenRouterAPI.__new__(OpenRouterAPI).should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is False
+
+
 # ---------- Anthropic ----------
 
 
