@@ -6,6 +6,7 @@
 - OpenAI Compatible: Fixed concurrent sample failures during credential refresh, including OpenRouter evaluations on Hawk, and added an overridable `ModelAPI.refresh_credentials()` for model API extensions.
 - Agent Bridge: New `sandbox_model_proxy()` runs the sandbox agent bridge's in-sandbox model proxy with your own request handlers, for example to forward requests unchanged to a model gateway.
 - Util: New `bind_sandbox_environment()` binds a `SandboxEnvironment` you construct yourself as the current context's sandbox, outside an eval sample.
+- Agent Bridge: New `BridgeConversationSelector` exposes `AgentBridge`'s main-thread selection rule as a standalone tracker, for a caller that replays bridged calls outside a live bridge.
 
 ## 0.3.273 (29 September 2026)
 

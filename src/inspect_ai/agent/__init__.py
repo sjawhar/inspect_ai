@@ -7,7 +7,7 @@ from ._bridge.bridge import agent_bridge, bridge
 from ._bridge.sandbox.bridge import sandbox_agent_bridge
 from ._bridge.sandbox.proxy import ModelProxy, ModelProxyError, sandbox_model_proxy
 from ._bridge.sandbox.types import SandboxAgentBridge
-from ._bridge.types import AgentBridge
+from ._bridge.types import AgentBridge, BridgeConversation, BridgeConversationSelector
 from ._channel import (
     AgentChannel,
     AgentInterrupted,
@@ -40,6 +40,8 @@ __all__ = [
     "ModelProxy",
     "ModelProxyError",
     "AgentBridge",
+    "BridgeConversation",
+    "BridgeConversationSelector",
     "SandboxAgentBridge",
     "BridgedToolsSpec",
     "content_only",
