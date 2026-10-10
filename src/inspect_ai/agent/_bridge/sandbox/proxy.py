@@ -99,11 +99,17 @@ async def sandbox_model_proxy(
     request declared as a function tool, with a description matching a bridged
     tool's, grants that tool one execution with exactly those arguments. A tool
     declared any other way (a Responses namespace or `tool_search` result)
-    grants nothing, so a call to it is denied.
+    grants nothing, so a call to it is denied. Unlike `sandbox_agent_bridge`,
+    this function has no `approval` parameter and applies no `ApprovalPolicy`
+    to a bridged tool call: gating is execution grants only.
 
     Handler contract, read from the proxy's source
-    (`inspect_sandbox_tools/_agent_bridge/proxy.py`; line numbers are those of
-    the file as built into sandbox tools v32-tl1):
+    (`inspect_sandbox_tools/_agent_bridge/proxy.py`). The line numbers below
+    were read off one pinned build and are illustrative, not exact for every
+    revision: the injected sandbox-tools build this fork pins can move ahead
+    of them, so treat them as a pointer into roughly the right area of the
+    file, not a verified citation, and re-read the actual pinned source to
+    confirm current behavior before relying on specifics:
 
     - Arguments: the host calls `handler(**params)` with the keyword arguments
       the proxy filed: always `json_data`, the client's JSON request body.
