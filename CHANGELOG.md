@@ -4,6 +4,7 @@
 - Local sandbox: `exec(user=...)` now rejects unsupported users instead of ignoring them; the current effective user's name or UID is accepted on POSIX.
 - Control Channel: `inspect ctl ... --log-dir` now shows running and completed-but-unflushed samples, with current counts and their events, for evals run with `--log-shared`.
 - OpenAI Compatible: Fixed concurrent sample failures during credential refresh, including OpenRouter evaluations on Hawk, and added an overridable `ModelAPI.refresh_credentials()` for model API extensions.
+- Logging: New `EvalLogWriter` writes one eval log incrementally outside Inspect's own eval loop (open a log, start and complete samples with live-streamed events, finish it), for a caller running its own agent loop.
 
 ## 0.3.273 (29 September 2026)
 

@@ -86,9 +86,11 @@ from ._transcript import (
     TranscriptHistoryUnavailableError,
     transcript,
 )
+from ._writer import EvalLogWriter
 
 __all__ = [
     "WriteConflictError",
+    "EvalLogWriter",
     "ConfigUpdate",
     "ConfigValueChange",
     "effective_eval_config",
