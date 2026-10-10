@@ -1873,6 +1873,14 @@
       "undescribed": 4
     }
   },
+  "tests/tools/test_mcp_session_isolation.py": {
+    "pyright: ignore[reportArgumentType]": {
+      "count": 1
+    },
+    "type: ignore[arg-type]": {
+      "count": 1
+    }
+  },
   "tests/tools/test_mcp_stdio_stderr.py": {
     "type: ignore": {
       "count": 4,
