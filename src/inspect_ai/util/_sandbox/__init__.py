@@ -10,7 +10,7 @@ from .compose import (
     is_dockerfile,
     parse_compose_yaml,
 )
-from .context import sandbox, sandbox_default, sandbox_with
+from .context import bind_sandbox_environment, sandbox, sandbox_default, sandbox_with
 from .docker.docker import DockerSandboxEnvironment  # noqa: F401
 from .environment import (
     SandboxConnection,
@@ -71,6 +71,7 @@ __all__ = [
     "SandboxUserUnsupportedError",
     "sandboxenv",
     "sandbox",
+    "bind_sandbox_environment",
     "sandbox_with",
     "sandbox_default",
     "sandbox_service",
