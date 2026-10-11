@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import AsyncIterator, cast
 
+import anyio
 from pydantic import JsonValue
 
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -36,6 +37,66 @@ _GENERATE_METHODS = {
 _TOOL_METHODS = ("list_tools", "call_tool")
 
 
+class _ToolSuspension:
+    """Whether a model proxy's tools are suspended, and the tool calls it cancels.
+
+    Needs no lock: suspension and the service's method calls all run on the
+    event loop thread.
+    """
+
+    def __init__(self) -> None:
+        self.suspended = False
+        self._running: set[anyio.CancelScope] = set()
+
+    def suspend(self) -> None:
+        self.suspended = True
+        for scope in list(self._running):
+            scope.cancel()
+
+    def resume(self) -> None:
+        self.suspended = False
+
+    def suspendable_list_tools(
+        self, method: SandboxServiceMethod
+    ) -> SandboxServiceMethod:
+        """`method`, answering with no tools while suspended."""
+
+        async def list_tools(**params: JsonValue) -> JsonValue:
+            if self.suspended:
+                return []
+            return await method(**params)
+
+        return list_tools
+
+    def suspendable_call_tool(
+        self, method: SandboxServiceMethod
+    ) -> SandboxServiceMethod:
+        """`method`, refused while suspended and cancelled by a suspension while it runs."""
+
+        async def call_tool(**params: JsonValue) -> JsonValue:
+            name = f"{params.get('server')}/{params.get('tool')}"
+            if self.suspended:
+                raise PermissionError(
+                    f"Tool call '{name}' was refused: this model proxy's tools are "
+                    "suspended."
+                )
+            result: JsonValue = None
+            with anyio.CancelScope() as scope:
+                self._running.add(scope)
+                try:
+                    result = await method(**params)
+                finally:
+                    self._running.discard(scope)
+            if scope.cancel_called:
+                raise PermissionError(
+                    f"Tool call '{name}' was cancelled: this model proxy's tools were "
+                    "suspended while it ran."
+                )
+            return result
+
+        return call_tool
+
+
 @dataclass(frozen=True)
 class ModelProxy:
     """A model proxy running inside a sandbox (see `sandbox_model_proxy`)."""
@@ -45,6 +106,40 @@ class ModelProxy:
 
     mcp_server_configs: list[MCPServerConfigHTTP] = field(default_factory=list)
     """MCP server configs for the bridged tools, one per `BridgedToolsSpec`."""
+
+    _tools: _ToolSuspension = field(
+        default_factory=_ToolSuspension, init=False, repr=False, compare=False
+    )
+
+    @property
+    def tools_suspended(self) -> bool:
+        """Whether the proxy's tools are suspended (see `suspend_tools`)."""
+        return self._tools.suspended
+
+    def suspend_tools(self) -> None:
+        """Stop serving the proxy's tools while it keeps serving model calls.
+
+        Use this when the proxy stays up for model calls after the agent's turn
+        (for example, for a model used in scoring), so that processes the agent
+        left running in the sandbox cannot call its tools. While the tools are
+        suspended, listing the tools of the proxy's MCP servers returns none, a
+        tool call is refused with an error, and tool calls in model responses
+        grant no executions. A tool call already running is cancelled and
+        answered with an error. Calls are refused on the host, so nothing in
+        the sandbox can bypass the suspension. It applies to `bridged_tools`
+        and to caller-supplied `list_tools` and `call_tool` methods alike.
+        Calling it while the tools are suspended has no effect.
+        """
+        self._tools.suspend()
+
+    def resume_tools(self) -> None:
+        """Serve the proxy's tools again after `suspend_tools`.
+
+        A call the model proposed before the suspension, and that has not run,
+        can run once after resuming. Calling it while the tools are not
+        suspended has no effect.
+        """
+        self._tools.resume()
 
 
 class ModelProxyError(Exception):
@@ -101,7 +196,9 @@ async def sandbox_model_proxy(
     declared any other way (a Responses namespace or `tool_search` result)
     grants nothing, so a call to it is denied. Unlike `sandbox_agent_bridge`,
     this function has no `approval` parameter and applies no `ApprovalPolicy`
-    to a bridged tool call: gating is execution grants only.
+    to a bridged tool call: gating is execution grants only. To keep the proxy
+    for model calls after the agent's turn without serving its tools, call
+    `ModelProxy.suspend_tools()` (and `resume_tools()` to serve them again).
 
     Handler contract, read from the proxy's source
     (`inspect_sandbox_tools/_agent_bridge/proxy.py`). The line numbers below
@@ -214,18 +311,23 @@ async def sandbox_model_proxy(
         model=None,
     )
     _register_bridged_tool_specs(bridge, bridged_tools or [], port)
+    model_proxy = ModelProxy(
+        port=port, mcp_server_configs=list(bridge.mcp_server_configs)
+    )
+    tools = model_proxy._tools
 
     service_methods: dict[str, SandboxServiceMethod] = {
-        method: _serve_generate(method, methods.get(method), bridge)
+        method: _serve_generate(method, methods.get(method), bridge, tools)
         for method in _GENERATE_METHODS
     }
     if bridged_tools:
-        service_methods["list_tools"] = list_tools(bridge)
-        service_methods["call_tool"] = call_tool(bridge)
-    else:
-        service_methods.update(
-            {name: methods[name] for name in _TOOL_METHODS if name in methods}
+        service_methods["list_tools"] = tools.suspendable_list_tools(list_tools(bridge))
+        service_methods["call_tool"] = tools.suspendable_call_tool(call_tool(bridge))
+    elif "list_tools" in methods:
+        service_methods["list_tools"] = tools.suspendable_list_tools(
+            methods["list_tools"]
         )
+        service_methods["call_tool"] = tools.suspendable_call_tool(methods["call_tool"])
 
     sandbox_env = await sandbox_with_injected_tools(sandbox=sandbox)
     async with _model_proxy_service(
@@ -236,7 +338,7 @@ async def sandbox_model_proxy(
         polling_interval=polling_interval,
         caller="sandbox_model_proxy",
     ):
-        yield ModelProxy(port=port, mcp_server_configs=list(bridge.mcp_server_configs))
+        yield model_proxy
 
 
 def _validate_methods(
@@ -268,14 +370,18 @@ def _validate_methods(
 
 
 def _serve_generate(
-    method: str, handler: ModelProxyMethod | None, bridge: SandboxAgentBridge
+    method: str,
+    handler: ModelProxyMethod | None,
+    bridge: SandboxAgentBridge,
+    tools: _ToolSuspension,
 ) -> SandboxServiceMethod:
     """The service method for `method`: `handler` with errors forwarded and grants minted.
 
     An exception from `handler` (other than `LimitExceededError`, which ends a
     sample) is returned as a provider error so the proxy answers the client and
     stays up; a missing handler answers 404. Tool calls in a successful result
-    mint execution grants on `bridge` for its bridged tools.
+    mint execution grants on `bridge` for its bridged tools, unless `tools` are
+    suspended.
     """
 
     async def generate(**params: JsonValue) -> JsonValue:
@@ -313,6 +419,7 @@ def _serve_generate(
 
         if (
             bridge.bridged_tools
+            and not tools.suspended
             and isinstance(result, dict)
             and PROVIDER_ERROR_KEY not in result
         ):

@@ -5,6 +5,7 @@ import json
 from typing import Any, AsyncIterator
 from unittest.mock import MagicMock
 
+import anyio
 import pytest
 from pydantic import JsonValue
 from test_helpers.utils import skip_if_no_docker
@@ -550,6 +551,286 @@ async def test_provider_error_result_grants_nothing(
 
 
 # ---------------------------------------------------------------------------
+# Suspending the tools while the proxy keeps serving model calls
+# ---------------------------------------------------------------------------
+
+_ADD_ARGUMENTS: dict[str, JsonValue] = {"x": 2, "y": 3}
+
+
+@tool
+def blocking_add(started: anyio.Event, release: anyio.Event, events: list[str]):
+    async def execute(x: int, y: int) -> str:
+        """Add two numbers once released.
+
+        Args:
+            x: First number to add.
+            y: Second number to add.
+        """
+        started.set()
+        try:
+            await release.wait()
+        except anyio.get_cancelled_exc_class():
+            events.append("cancelled")
+            raise
+        events.append("finished")
+        return str(x + y)
+
+    return execute
+
+
+@pytest.mark.parametrize("require_proposal", [True, False])
+async def test_suspended_tools_are_refused_and_unlisted_while_model_calls_are_served(
+    monkeypatch: pytest.MonkeyPatch, require_proposal: bool
+) -> None:
+    method, request_body, response = _DIALECTS[0]
+    call_log: list[dict[str, int]] = []
+    handled: list[dict[str, JsonValue]] = []
+
+    async def raw(json_data: dict[str, JsonValue], **_: JsonValue) -> JsonValue:
+        handled.append(json_data)
+        return response
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={method: raw},
+        bridged_tools=[
+            BridgedToolsSpec(
+                name="calc",
+                tools=[calculator_add(call_log)],
+                require_proposal=require_proposal,
+            )
+        ],
+    ) as model_proxy:
+        assert not model_proxy.tools_suspended
+        # the call is proposed (granted) before the tools are suspended
+        assert await served.methods[method](json_data=request_body) == response
+
+        model_proxy.suspend_tools()
+
+        assert model_proxy.tools_suspended
+        assert await served.methods["list_tools"](server="calc") == []
+        with pytest.raises(PermissionError, match="tools are suspended"):
+            await served.methods["call_tool"](
+                server="calc", tool="calculator_add", arguments=_ADD_ARGUMENTS
+            )
+        assert await served.methods[method](json_data=request_body) == response
+
+    assert call_log == []
+    assert handled == [request_body, request_body]
+
+
+async def test_resumed_tools_are_listed_and_served_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method, request_body, response = _DIALECTS[0]
+    call_log: list[dict[str, int]] = []
+
+    async def raw(json_data: dict[str, JsonValue], **_: JsonValue) -> JsonValue:
+        return response
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={method: raw},
+        bridged_tools=[BridgedToolsSpec(name="calc", tools=[calculator_add(call_log)])],
+    ) as model_proxy:
+        listed = await served.methods["list_tools"](server="calc")
+        await served.methods[method](json_data=request_body)
+
+        model_proxy.suspend_tools()
+        model_proxy.resume_tools()
+
+        assert not model_proxy.tools_suspended
+        assert await served.methods["list_tools"](server="calc") == listed
+        # a proposal made before the suspension still grants its one execution
+        assert (
+            await served.methods["call_tool"](
+                server="calc", tool="calculator_add", arguments=_ADD_ARGUMENTS
+            )
+            == "5"
+        )
+
+    assert call_log == [_ADD_ARGUMENTS]
+
+
+async def test_model_responses_while_suspended_grant_no_executions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method, request_body, response = _DIALECTS[0]
+    call_log: list[dict[str, int]] = []
+
+    async def raw(json_data: dict[str, JsonValue], **_: JsonValue) -> JsonValue:
+        return response
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={method: raw},
+        bridged_tools=[BridgedToolsSpec(name="calc", tools=[calculator_add(call_log)])],
+    ) as model_proxy:
+        model_proxy.suspend_tools()
+        assert await served.methods[method](json_data=request_body) == response
+        model_proxy.resume_tools()
+
+        with pytest.raises(PermissionError, match="not proposed"):
+            await served.methods["call_tool"](
+                server="calc", tool="calculator_add", arguments=_ADD_ARGUMENTS
+            )
+
+    assert call_log == []
+
+
+async def test_suspend_and_resume_are_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_log: list[dict[str, int]] = []
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={"generate_anthropic": _ok},
+        bridged_tools=[
+            BridgedToolsSpec(
+                name="calc", tools=[calculator_add(call_log)], require_proposal=False
+            )
+        ],
+    ) as model_proxy:
+        call_tool = served.methods["call_tool"]
+
+        model_proxy.resume_tools()
+        assert not model_proxy.tools_suspended
+        assert (
+            await call_tool(
+                server="calc", tool="calculator_add", arguments={"x": 1, "y": 1}
+            )
+            == "2"
+        )
+
+        model_proxy.suspend_tools()
+        model_proxy.suspend_tools()
+        assert model_proxy.tools_suspended
+        with pytest.raises(PermissionError, match="tools are suspended"):
+            await call_tool(
+                server="calc", tool="calculator_add", arguments={"x": 2, "y": 2}
+            )
+
+        # one resume undoes any number of suspends; a second has no effect
+        model_proxy.resume_tools()
+        assert not model_proxy.tools_suspended
+        assert (
+            await call_tool(
+                server="calc", tool="calculator_add", arguments={"x": 3, "y": 3}
+            )
+            == "6"
+        )
+        model_proxy.resume_tools()
+        assert (
+            await call_tool(
+                server="calc", tool="calculator_add", arguments={"x": 4, "y": 4}
+            )
+            == "8"
+        )
+
+    assert call_log == [{"x": 1, "y": 1}, {"x": 3, "y": 3}, {"x": 4, "y": 4}]
+
+
+async def test_suspend_cancels_a_tool_call_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = anyio.Event()
+    release = anyio.Event()
+    events: list[str] = []
+    errors: list[PermissionError] = []
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={"generate_anthropic": _ok},
+        bridged_tools=[
+            BridgedToolsSpec(
+                name="slow",
+                tools=[blocking_add(started, release, events)],
+                require_proposal=False,
+            )
+        ],
+    ) as model_proxy:
+        call_tool = served.methods["call_tool"]
+
+        async def call_in_flight() -> None:
+            try:
+                await call_tool(
+                    server="slow", tool="blocking_add", arguments=_ADD_ARGUMENTS
+                )
+            except PermissionError as ex:
+                errors.append(ex)
+
+        # bounded, so a suspension that leaves the call running fails the test
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(call_in_flight)
+                await started.wait()
+                model_proxy.suspend_tools()
+
+        # the running tool was cancelled and its call answered with the refusal
+        assert events == ["cancelled"]
+        assert len(errors) == 1
+        assert "suspended while it ran" in str(errors[0])
+
+        # releasing it afterwards changes nothing; after resume, calls run again
+        release.set()
+        model_proxy.resume_tools()
+        assert (
+            await call_tool(
+                server="slow", tool="blocking_add", arguments=_ADD_ARGUMENTS
+            )
+            == "5"
+        )
+
+    assert events == ["cancelled", "finished"]
+
+
+async def test_suspend_tools_also_covers_caller_tool_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def list_tools(server: str) -> JsonValue:
+        return [{"name": f"{server}-tool"}]
+
+    async def call_tool(server: str, tool: str, arguments: JsonValue) -> JsonValue:
+        calls.append(f"{server}/{tool}")
+        return "ok"
+
+    served = _ServedTable(monkeypatch, proxy_module)
+    async with sandbox_model_proxy(
+        _unused_sandbox(),
+        methods={
+            "generate_anthropic": _ok,
+            "list_tools": list_tools,
+            "call_tool": call_tool,
+        },
+    ) as model_proxy:
+        model_proxy.suspend_tools()
+        assert await served.methods["list_tools"](server="s") == []
+        with pytest.raises(PermissionError, match="tools are suspended"):
+            await served.methods["call_tool"](server="s", tool="t", arguments={})
+        assert (
+            await served.methods["generate_anthropic"](json_data={"model": "m"})
+            == FIXED_MESSAGE
+        )
+
+        model_proxy.resume_tools()
+        assert await served.methods["list_tools"](server="s") == [{"name": "s-tool"}]
+        assert (
+            await served.methods["call_tool"](server="s", tool="t", arguments={})
+            == "ok"
+        )
+
+    assert calls == ["s/t"]
+
+
+# ---------------------------------------------------------------------------
 # End to end in a Docker sandbox
 # ---------------------------------------------------------------------------
 
@@ -732,6 +1013,16 @@ def test_sandbox_model_proxy_end_to_end() -> None:
                 )
                 checks["call_proposed"] = await _mcp("tools/call", call)
                 checks["call_again"] = await _mcp("tools/call", call)
+
+                # suspended tools: none listed, calls refused, model calls served
+                model_proxy.suspend_tools()
+                checks["tools_list_suspended"] = await _mcp("tools/list")
+                checks["call_suspended"] = await _mcp("tools/call", call)
+                checks["fixed_suspended"] = await _curl(
+                    "/v1/messages", _anthropic_request("fixed")
+                )
+                model_proxy.resume_tools()
+                checks["tools_list_resumed"] = await _mcp("tools/list")
             return state
 
         return solve
@@ -783,7 +1074,7 @@ def test_sandbox_model_proxy_end_to_end() -> None:
     )
     assert checks["after_errors"] == (200, json.dumps(FIXED_MESSAGE))
     # the chat completions request never reached a handler
-    assert handled == ["fixed", "fixed", "overloaded", "bug", "fixed", "tool"]
+    assert handled == ["fixed", "fixed", "overloaded", "bug", "fixed", "tool", "fixed"]
 
     assert [t["name"] for t in checks["tools_list"]["result"]["tools"]] == [
         "calculator_add"
@@ -796,3 +1087,10 @@ def test_sandbox_model_proxy_end_to_end() -> None:
     ]
     assert "was not proposed" in checks["call_again"]["error"]["message"]
     assert call_log == [{"x": 5, "y": 3}]
+
+    assert checks["tools_list_suspended"]["result"]["tools"] == []
+    assert "tools are suspended" in checks["call_suspended"]["error"]["message"]
+    assert checks["fixed_suspended"] == (200, json.dumps(FIXED_MESSAGE))
+    assert [t["name"] for t in checks["tools_list_resumed"]["result"]["tools"]] == [
+        "calculator_add"
+    ]
