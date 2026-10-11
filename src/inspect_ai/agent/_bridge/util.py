@@ -3,7 +3,7 @@ import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from logging import getLogger
-from typing import Any, Callable, Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, cast
 
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
@@ -63,6 +63,9 @@ from inspect_ai.tool._tools._web_search._web_search import (
     _normalize_config,
 )
 from inspect_ai.util._json import JSONSchema
+
+if TYPE_CHECKING:
+    from inspect_ai.event._event import Event
 
 # Generation-tuning fields a scaffold may set on a bridged request that describe
 # *how* the underlying model generates. These are the Inspect model's province
@@ -483,6 +486,42 @@ def _restore_operator_message_source(
         bridge._pending_operator = 0
 
 
+_filter_call_scope: ContextVar[object | None] = ContextVar(
+    "_bridge_filter_call_scope", default=None
+)
+
+
+@contextmanager
+def _observe_filter_model_events() -> Iterator[Callable[[], bool]]:
+    """Report whether the enclosed filter call emitted a `ModelEvent` of its own.
+
+    Decided from the transcript, not from anything the filter returns: a filter
+    that calls `model.generate()` has already recorded that interaction. Transcript
+    subscribers fire synchronously in the emitting task's context, so a
+    `ModelEvent` seen while this call's scope marker is current came from this
+    filter call (or a task it spawned), never from a concurrent bridged request
+    writing to the same transcript.
+    """
+    from inspect_ai.event._model import ModelEvent
+    from inspect_ai.log._transcript import transcript
+
+    scope = object()
+    emitted = False
+
+    def on_event(event: "Event") -> None:
+        nonlocal emitted
+        if isinstance(event, ModelEvent) and _filter_call_scope.get() is scope:
+            emitted = True
+
+    token = _filter_call_scope.set(scope)
+    unsubscribe = transcript()._subscribe(on_event)
+    try:
+        yield lambda: emitted
+    finally:
+        unsubscribe()
+        _filter_call_scope.reset(token)
+
+
 def _record_filter_answered_interaction(
     bridge: AgentBridge,
     model: Model,
@@ -583,7 +622,9 @@ async def bridge_generate(
     if codex_thread_metadata is not None:
         metadata["agent_bridge"] = {"codex": codex_thread_metadata}
     with use_model_event_metadata(metadata):
-        return await _bridge_generate(bridge, model, input, tools, tool_choice, config)
+        return await _bridge_generate(
+            bridge, model, input, tools, tool_choice, config, declared_in_input
+        )
 
 
 async def _bridge_generate(
@@ -593,6 +634,7 @@ async def _bridge_generate(
     tools: Sequence[ToolInfo | Tool],
     tool_choice: ToolChoice | None,
     config: GenerateConfig,
+    declared_in_input: Callable[[list[ChatMessage]], Sequence[ToolInfo]] | None = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     # restore operator provenance lost to a bridged scaffold's round-trip (e.g.
     # claude_code re-emits an operator message as a plain user message). Done
@@ -625,6 +667,7 @@ async def _bridge_generate(
 
         # Apply filter if we have it (can either return output or alternate inputs)
         output: ModelOutput | None = None
+        filter_recorded_event = False
         if bridge.filter:
             # tool_to_tool_info (via ToolDef) preserves `options` — including
             # the INTERNAL_TOOL_TYPE marker — so the filter sees the same
@@ -634,14 +677,16 @@ async def _bridge_generate(
                 tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
                 for tool in tools
             ]
-            if _is_model_filter(bridge.filter):
-                result = await bridge.filter(
-                    model, input_messages, tool_info, tool_choice, config
-                )
-            else:
-                result = await bridge.filter(
-                    model.name, input_messages, tool_info, tool_choice, config
-                )
+            with _observe_filter_model_events() as filter_emitted_event:
+                if _is_model_filter(bridge.filter):
+                    result = await bridge.filter(
+                        model, input_messages, tool_info, tool_choice, config
+                    )
+                else:
+                    result = await bridge.filter(
+                        model.name, input_messages, tool_info, tool_choice, config
+                    )
+            filter_recorded_event = filter_emitted_event()
             if isinstance(result, ModelOutput):
                 output = result
             elif isinstance(result, GenerateInput):
@@ -671,7 +716,7 @@ async def _bridge_generate(
                         refusals += 1
                         continue
                     raise
-        else:
+        elif not filter_recorded_event:
             # The filter answered instead of the provider, so `generate()` never
             # ran and recorded nothing. Record the interaction anyway: the
             # scaffold consumes this output, so a grader reading the transcript
@@ -679,7 +724,9 @@ async def _bridge_generate(
             # for -- indistinguishable from a message the agent never produced,
             # or from a foreign injection. `call=None` plus the
             # BRIDGE_FILTER_SYNTHETIC metadata flag distinguish it from a real
-            # provider round-trip.
+            # provider round-trip. A filter that generated (e.g. by calling
+            # `model.generate()`) already recorded its own event, so a second one
+            # here would show the same output twice.
             _record_filter_answered_interaction(
                 bridge, model, input_messages, tools, tool_choice, config, output
             )

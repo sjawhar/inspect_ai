@@ -281,18 +281,73 @@ async def test_filter_answered_request_still_records_an_event() -> None:
     assert getattr(event, "output").completion == "answered by the filter"
     assert getattr(event, "call") is None
 
-async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests() -> None:
+
+async def test_filter_that_generates_records_only_its_own_event() -> None:
+    """A filter that calls `model.generate()` already recorded that interaction.
+
+    Its own `ModelEvent` accounts for the output the scaffold consumes, so a
+    synthetic event on top of it would put the same output in the transcript
+    twice.
+    """
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.types import AgentBridge
+    from inspect_ai.agent._bridge.util import bridge_generate
+    from inspect_ai.event._model import ModelEvent
+    from inspect_ai.log._transcript import Transcript, init_transcript, transcript
+    from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
+    from inspect_ai.model._generate_config import GenerateConfig
+    from inspect_ai.model._model import BRIDGE_FILTER_SYNTHETIC, BRIDGE_REQUESTED_MODEL
+    from inspect_ai.model._model_output import ModelOutput
+    from inspect_ai.tool._tool_choice import ToolChoice
+    from inspect_ai.tool._tool_info import ToolInfo
+
+    async def _filter(
+        model: Model,
+        input: list[ChatMessage],
+        tools: list[ToolInfo],
+        tool_choice: ToolChoice | None,
+        config: GenerateConfig,
+    ) -> ModelOutput:
+        return await model.generate(input)
+
+    init_transcript(Transcript())
+    bridge = AgentBridge(AgentState(messages=[]), filter=_filter)
+    model = get_model("mockllm/model")
+
+    output, _ = await bridge_generate(
+        bridge,
+        model,
+        [ChatMessageUser(content="hello")],
+        [],
+        None,
+        GenerateConfig(),
+        requested_model="codex-auto-review",
+    )
+
+    events = [e for e in transcript().events if isinstance(e, ModelEvent)]
+    assert len(events) == 1, [e.metadata for e in events]
+    event = events[0]
+    metadata = event.metadata or {}
+    assert BRIDGE_FILTER_SYNTHETIC not in metadata
+    assert metadata.get(BRIDGE_REQUESTED_MODEL) == "codex-auto-review"
+    assert event.call is not None
+    assert event.output.completion == output.completion
+
+
+async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests() -> (
+    None
+):
     """Each request's selected headers reach only its own bridged event."""
     from inspect_ai._util._async import tg_collect
     from inspect_ai.agent._agent import AgentState
     from inspect_ai.agent._bridge.types import AgentBridge
     from inspect_ai.agent._bridge.util import bridge_generate
+    from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
     from inspect_ai.model._generate_config import GenerateConfig
     from inspect_ai.model._model import (
         BRIDGE_FILTER_SYNTHETIC,
         BRIDGE_REQUEST_HEADERS,
     )
-    from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
     from inspect_ai.model._model_output import ModelOutput
 
     async def _filter(
@@ -328,9 +383,7 @@ async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests(
                 [],
                 [],
                 None,
-                GenerateConfig(
-                    extra_headers={"x-provider-feature": "provider"}
-                ),
+                GenerateConfig(extra_headers={"x-provider-feature": "provider"}),
                 metadata_headers={
                     "x-opencode-session": "provider-session",
                     "x-parent-session-id": "provider-parent",
@@ -345,9 +398,7 @@ async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests(
                 [ChatMessageUser(content="filter request")],
                 [],
                 None,
-                GenerateConfig(
-                    extra_headers={"x-provider-feature": "filter"}
-                ),
+                GenerateConfig(extra_headers={"x-provider-feature": "filter"}),
                 metadata_headers={
                     "x-session-id": "filter-session",
                     "x-parent-session-id": "filter-parent",
@@ -426,6 +477,7 @@ async def test_metadata_headers_do_not_reach_model_provider() -> None:
     assert provider_headers["x-provider-feature"] == "preserve"
     assert "x-opencode-session" not in provider_headers
 
+
 @pytest.mark.parametrize(
     ("factory_name", "adapter_name"),
     [
@@ -497,7 +549,5 @@ def test_bridge_rejects_delimited_event_metadata_header_names() -> None:
     with pytest.raises(ValueError, match="valid HTTP token"):
         AgentBridge(
             AgentState(messages=[]),
-            model_event_metadata_headers=(
-                "x-opencode-session,x-parent-session-id",
-            ),
+            model_event_metadata_headers=("x-opencode-session,x-parent-session-id",),
         )
