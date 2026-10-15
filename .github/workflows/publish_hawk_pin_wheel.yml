@@ -1,0 +1,369 @@
+# FORK-ONLY. Builds inspect_ai's wheel for one commit and attaches it to the release tagged
+# hawk-pin/<40-hex commit>, the tag pointing at that commit. hawk's `inspect` extra pins that file
+# by URL and #sha256=, so a hawk runner pod downloads one wheel instead of cloning this
+# repository's history. One upload per tag, never replaced: a rerun rebuilds and must reproduce
+# the uploaded bytes, so the build is pinned (uv, Python, the hash-locked build closure in
+# publish_hawk_pin_wheel.build-constraints.txt, SOURCE_DATE_EPOCH from the commit).
+#
+# TRIGGER: a push to release/** builds the pushed commit while it is the head of a release/
+# branch. A push to candidate/hawk-pin-wheel never builds: it makes the workflow run once, which
+# registers it, because GitHub dispatches only a workflow that has run or that sits on the default
+# branch, and this fork's default branch is an upstream mirror. workflow_dispatch with `commit`
+# builds a commit that is the head of a release/ branch or that already has its hawk-pin/<commit>
+# tag (a rerun after the release branch has moved on).
+#
+# The tag and release are created before the build, while the commit still has a branch ref:
+# creating a tag at an unreferenced commit that changes workflow files needs the `workflows`
+# permission, which GITHUB_TOKEN cannot hold.
+#
+# VERSION: setuptools_scm's version with its local segment stripped (0.3.NNN.devN), a version PyPI
+# never serves. The tag's own `+upstream` label survives setuptools_scm's local_scheme, so the
+# stripped version is passed as SETUPTOOLS_SCM_PRETEND_VERSION_FOR_INSPECT_AI, behind a clean-tree
+# guard (stripping would also hide a dirty marker) and a full-history checkout (a shallow one
+# yields 0.1.devN).
+#
+# Regenerate the constraints file with the command in its header, under the uv version below.
+
+name: Publish hawk-pin wheel (fork)
+run-name: Publish hawk-pin wheel for ${{ inputs.commit || github.sha }}
+
+on:
+  push:
+    branches:
+      - "release/**"
+      - "candidate/hawk-pin-wheel"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Full 40-character inspect_ai commit to build (a release/ head, or one that already has its hawk-pin/<commit> tag)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # git tag, gh release create/upload/edit
+
+concurrency:
+  # Per commit: two runs for one commit would race to upload the same tag's wheel; runs for
+  # different commits never wait on each other.
+  group: publish-hawk-pin-wheel-${{ inputs.commit || github.sha }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.12.3"
+  PYTHON_VERSION: "3.12.13"
+
+jobs:
+  gate:
+    name: Gate the commit and create its release
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.target.outputs.commit }}
+      build: ${{ steps.gate.outputs.build }}
+    steps:
+      - name: Resolve the target commit
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            commit="$INPUT_COMMIT"
+          else
+            commit="$PUSH_SHA"
+          fi
+          if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '::error::commit must be 40 lowercase hex characters, got %q\n' "$commit"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Require a release head or an existing hawk-pin tag
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+        run: |
+          set -euo pipefail
+          export TAG_REF="refs/tags/hawk-pin/${COMMIT}"
+          release_heads=$(gh api --paginate "repos/${GH_REPO}/git/matching-refs/heads/release/" \
+            --jq '.[] | select(.object.sha == env.COMMIT) | .ref')
+          tag_count=$(gh api "repos/${GH_REPO}/git/matching-refs/tags/hawk-pin/${COMMIT}" \
+            --jq '[.[] | select(.ref == env.TAG_REF)] | length')
+          tag_present=false
+          if [ "$tag_count" != "0" ]; then
+            tag_commit=$(gh api "repos/${GH_REPO}/commits/${TAG_REF}" --jq .sha)
+            if [ "$tag_commit" != "$COMMIT" ]; then
+              echo "::error::${TAG_REF} points at ${tag_commit}, not ${COMMIT}"
+              exit 1
+            fi
+            tag_present=true
+          fi
+          echo "tag_present=$tag_present" >> "$GITHUB_OUTPUT"
+          if [ -n "$release_heads" ]; then
+            echo "${COMMIT} is the head of: ${release_heads//$'\n'/ }"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$tag_present" = "true" ]; then
+            echo "${COMMIT} is no release head, but ${TAG_REF} already points at it"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            echo "::notice::${COMMIT} is not the head of a release/ branch; nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::${COMMIT} is not the head of a release/ branch and has no hawk-pin tag"
+            exit 1
+          fi
+
+      - name: Create the hawk-pin tag and release if absent
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT: ${{ steps.target.outputs.commit }}
+          TAG_PRESENT: ${{ steps.gate.outputs.tag_present }}
+        run: |
+          set -euo pipefail
+          export TAG="hawk-pin/${COMMIT}"
+          gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"' > "$RUNNER_TEMP/releases.txt"
+          count=$(wc -l < "$RUNNER_TEMP/releases.txt")
+          if [ "$count" -gt 1 ]; then
+            echo "::error::${count} releases carry tag ${TAG}"
+            exit 1
+          elif [ "$count" -eq 1 ]; then
+            read -r release_id draft < "$RUNNER_TEMP/releases.txt"
+            if [ "$draft" != "false" ]; then
+              echo "::error::release ${release_id} for ${TAG} is a draft; its assets are not public"
+              exit 1
+            fi
+            echo "release ${release_id} for ${TAG} exists"
+          else
+            notes="inspect_ai wheel for ${COMMIT}, built by .github/workflows/publish_hawk_pin_wheel.yml. Upload pending."
+            if [ "$TAG_PRESENT" = "true" ]; then
+              gh release create "$TAG" --verify-tag --title "$TAG" --notes "$notes" --latest=false
+            else
+              gh release create "$TAG" --target "$COMMIT" --title "$TAG" --notes "$notes" --latest=false
+            fi
+          fi
+          tag_commit=$(gh api "repos/${GH_REPO}/commits/refs/tags/${TAG}" --jq .sha)
+          if [ "$tag_commit" != "$COMMIT" ]; then
+            echo "::error::${TAG} points at ${tag_commit}, not ${COMMIT}"
+            exit 1
+          fi
+
+  build:
+    name: Build, publish and verify the wheel
+    # A pinned image as well as pinned tools: a rerun must rebuild the uploaded bytes.
+    runs-on: ubuntu-24.04
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    env:
+      COMMIT: ${{ needs.gate.outputs.commit }}
+      GH_REPO: ${{ github.repository }}
+      CONSTRAINTS: ci/.github/workflows/publish_hawk_pin_wheel.build-constraints.txt
+    steps:
+      - name: Checkout this workflow's ref (for the build constraints)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: ci
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Checkout the target commit with full history and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.commit }}
+          path: src
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          # uv's releases are public; keep this job's write token away from the action.
+          github-token: ""
+
+      - name: Refuse a dirty or wrong checkout
+        working-directory: src
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$COMMIT" ]; then
+            echo "::error::checked out ${head}, expected ${COMMIT}"
+            exit 1
+          fi
+          dirty=$(git status --porcelain)
+          if [ -n "$dirty" ]; then
+            echo "::error::the checkout is not clean:"
+            echo "$dirty"
+            exit 1
+          fi
+
+      - name: Compute the version
+        id: version
+        run: |
+          set -euo pipefail
+          scm_venv="$RUNNER_TEMP/setuptools-scm"
+          uv venv --no-project --managed-python --python "$PYTHON_VERSION" "$scm_venv"
+          uv pip install --python "$scm_venv/bin/python" --require-hashes -r "$CONSTRAINTS"
+          full=$(cd src && "$scm_venv/bin/python" -m setuptools_scm)
+          version="${full%%+*}"
+          if ! [[ "$version" =~ ^0\.3\.[0-9]+\.dev[0-9]+$ ]]; then
+            echo "::error::setuptools_scm gave '${full}'; '${version}' is not 0.3.N.devN (shallow or tagless checkout?)"
+            exit 1
+          fi
+          echo "setuptools_scm: ${full} -> ${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the wheel
+        id: wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # setuptools stores each file's mode in the wheel, and the checkout's and the build's
+          # file modes follow the umask: set them from git's own modes so a rerun on any runner
+          # rebuilds the same bytes.
+          umask 0022
+          (cd src && git ls-files -z --format='%(objectmode) %(path)' | sed -zn 's/^100644 //p' | xargs -0r chmod 0644)
+          (cd src && git ls-files -z --format='%(objectmode) %(path)' | sed -zn 's/^100755 //p' | xargs -0r chmod 0755)
+          SOURCE_DATE_EPOCH=$(git -C src show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_INSPECT_AI="$VERSION"
+          (cd src && uv build --wheel --managed-python --python "$PYTHON_VERSION" \
+            --require-hashes --build-constraints "../$CONSTRAINTS" --out-dir ../dist)
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected one wheel, found ${#wheels[@]}: ${wheels[*]}"
+            exit 1
+          fi
+          name=$(basename "${wheels[0]}")
+          if [[ "$name" == *+* ]]; then
+            echo "::error::wheel name carries a local version segment: ${name}"
+            exit 1
+          fi
+          if [ "$name" != "inspect_ai-${VERSION}-py3-none-any.whl" ]; then
+            echo "::error::wheel name ${name} does not match version ${VERSION}"
+            exit 1
+          fi
+          sha256=$(sha256sum "${wheels[0]}" | cut -d' ' -f1)
+          echo "built ${name} sha256=${sha256} SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+          {
+            echo "name=$name"
+            echo "path=${wheels[0]}"
+            echo "sha256=$sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the wheel, or check the one already uploaded
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEEL_NAME: ${{ steps.wheel.outputs.name }}
+          WHEEL_PATH: ${{ steps.wheel.outputs.path }}
+          WHEEL_SHA256: ${{ steps.wheel.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          export TAG="hawk-pin/${COMMIT}"
+          release_id=$(gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | .id')
+          if ! [[ "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::expected one release for ${TAG}, got '${release_id}'"
+            exit 1
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          gh api "repos/${GH_REPO}/releases/${release_id}" > "$RUNNER_TEMP/release.json"
+          jq -r '.assets[] | select(.name | endswith(".whl")) | .name' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/wheels.txt"
+          mapfile -t wheels < "$RUNNER_TEMP/wheels.txt"
+          case "${#wheels[@]}" in
+            0)
+              # No --clobber: gh refuses an asset name that already exists.
+              gh release upload "$TAG" "$WHEEL_PATH"
+              echo "uploaded ${WHEEL_NAME}"
+              ;;
+            1)
+              existing="${wheels[0]}"
+              state=$(jq -r --arg n "$existing" '.assets[] | select(.name == $n) | .state' "$RUNNER_TEMP/release.json")
+              digest=$(jq -r --arg n "$existing" '.assets[] | select(.name == $n) | .digest' "$RUNNER_TEMP/release.json")
+              if [ "$existing" != "$WHEEL_NAME" ]; then
+                echo "::error::${TAG} already holds ${existing}; this build made ${WHEEL_NAME}. The version computation moved; the uploaded wheel is never replaced."
+                exit 1
+              fi
+              if [ "$state" != "uploaded" ]; then
+                echo "::error::${existing} on ${TAG} is in state '${state}', not 'uploaded'"
+                exit 1
+              fi
+              if [ "$digest" != "sha256:${WHEEL_SHA256}" ]; then
+                echo "::error::${existing} on ${TAG} has digest ${digest}; this build made sha256:${WHEEL_SHA256}. The uploaded wheel is never replaced."
+                exit 1
+              fi
+              echo "${existing} is already uploaded with the rebuilt digest"
+              ;;
+            *)
+              echo "::error::${TAG} holds ${#wheels[@]} wheels: ${wheels[*]}"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify the public download
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.publish.outputs.release_id }}
+          WHEEL_NAME: ${{ steps.wheel.outputs.name }}
+          WHEEL_SHA256: ${{ steps.wheel.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GH_REPO}/releases/download/hawk-pin/${COMMIT}/${WHEEL_NAME}"
+          # Anonymous, following github.com's 302 to the asset host, as a runner pod does.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNNER_TEMP/published.whl" "$url"
+          published=$(sha256sum "$RUNNER_TEMP/published.whl" | cut -d' ' -f1)
+          if [ "$published" != "$WHEEL_SHA256" ]; then
+            echo "::error::${url} has sha256 ${published}; the build made ${WHEEL_SHA256}"
+            exit 1
+          fi
+          # GitHub records the asset digest at upload; allow it a moment to appear, never to differ.
+          digest=""
+          for _ in 1 2 3 4 5 6; do
+            digest=$(gh api "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+              --jq '.assets[] | select(.name == env.WHEEL_NAME) | .digest // ""')
+            [ -n "$digest" ] && break
+            sleep 10
+          done
+          if [ "$digest" != "sha256:${WHEEL_SHA256}" ]; then
+            echo "::error::the API reports digest '${digest}' for ${WHEEL_NAME}; the build made sha256:${WHEEL_SHA256}"
+            exit 1
+          fi
+          echo "verified ${url} sha256=${published}"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Record the URL and sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          URL: ${{ steps.verify.outputs.url }}
+          WHEEL_SHA256: ${{ steps.wheel.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "inspect_ai \`${VERSION}\` built from \`${COMMIT}\` by \`.github/workflows/publish_hawk_pin_wheel.yml\`."
+            echo
+            echo "- URL: ${URL}"
+            echo "- sha256: \`${WHEEL_SHA256}\`"
+            echo
+            echo "Pin:"
+            echo
+            echo '```'
+            echo "inspect-ai @ ${URL}#sha256=${WHEEL_SHA256}"
+            echo '```'
+          } > "$notes"
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "hawk-pin/${COMMIT}" --notes-file "$notes" --latest=false
